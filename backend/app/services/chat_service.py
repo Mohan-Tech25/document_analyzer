@@ -6,6 +6,10 @@ from app.repositories.chunk_repository import (
     ChunkRepository,
 )
 
+from app.repositories.analysis_repository import (
+    AnalysisRepository,
+)
+
 from app.services.retrieval_service import (
     RetrievalService,
 )
@@ -21,16 +25,26 @@ from app.services.ollama_service import (
 
 class ChatService:
     """
-    Service responsible for answering questions
-    using retrieved document context.
+    Service responsible for answering questions using
+    text, PDF, OCR, and image/vision context.
+
+    Text/PDF documents use RAG chunks.
+
+    Images can use both:
+    - OCR extracted text
+    - Vision analysis
+
+    Both sources are combined when available.
     """
 
     def __init__(
         self,
         retrieval_service: RetrievalService,
+        analysis_repository: AnalysisRepository,
         ollama_service: OllamaService,
     ):
         self.retrieval_service = retrieval_service
+        self.analysis_repository = analysis_repository
         self.ollama_service = ollama_service
 
     def answer_question(
@@ -40,7 +54,7 @@ class ChatService:
         question: str,
     ) -> dict:
         """
-        Answer a question using semantic RAG.
+        Answer a question using document/image context.
         """
 
         # -----------------------------------------
@@ -57,7 +71,6 @@ class ChatService:
         # -----------------------------------------
 
         try:
-
             retrieval_question = (
                 self.ollama_service
                 .understand_question(
@@ -66,86 +79,59 @@ class ChatService:
             )
 
         except Exception as e:
-
             raise ChatException(
                 "Failed to understand the question."
             ) from e
 
         if not retrieval_question.strip():
-
             raise ChatException(
                 "Could not understand the question."
             )
 
         # -----------------------------------------
-        # Detect broad document question
+        # Retrieve relevant RAG chunks
         # -----------------------------------------
 
-        broad_question_prompt = f"""
-You classify questions for a document
-question-answering system.
-
-The question is BROAD if the user wants to know
-about the document generally.
-
-Examples of BROAD questions:
-
-What is this document about?
-What information does this document contain?
-Tell me about this document.
-What does this document contain?
-What is this file about?
-Give me an overview of this document.
-Summarize this document.
-
-The question is SPECIFIC if the user asks for
-a particular fact, topic, person, value, or concept.
-
-Examples:
-
-What is JWT?
-What is the person's name?
-What technologies are mentioned?
-What is Flask?
-What is the phone number?
-
-Return ONLY:
-
-BROAD
-
-or
-
-SPECIFIC
-
-QUESTION:
-
-{retrieval_question}
-"""
+        relevant_chunks = []
 
         try:
-
-            question_type = (
-                self.ollama_service
-                .generate_response(
-                    prompt=broad_question_prompt
+            relevant_chunks = (
+                self.retrieval_service
+                .retrieve_relevant_chunks(
+                    connection=connection,
+                    document_id=document_id,
+                    question=retrieval_question,
+                    top_k=3,
                 )
-            ).strip().upper()
+            )
 
-        except Exception as e:
-
-            raise ChatException(
-                "Failed to determine question type."
-            ) from e
+        except Exception:
+            relevant_chunks = []
 
         # -----------------------------------------
-        # Retrieve document content
+        # Build OCR / document text context
         # -----------------------------------------
 
-        try:
+        text_context = ""
 
-            if question_type == "BROAD":
+        if relevant_chunks:
 
-                relevant_chunks = (
+            text_context = "\n\n".join(
+                chunk["content"]
+                for chunk in relevant_chunks
+                if chunk.get("content")
+            )
+
+        # -----------------------------------------
+        # FALLBACK:
+        # If semantic search finds nothing,
+        # retrieve the document's chunks.
+        # -----------------------------------------
+
+        if not text_context.strip():
+
+            try:
+                document_chunks = (
                     self.retrieval_service
                     .get_document_chunks(
                         connection=connection,
@@ -153,119 +139,148 @@ QUESTION:
                     )
                 )
 
-                relevant_chunks = [
-                    {
-                        **chunk,
-                        "distance": None,
-                    }
-                    for chunk in relevant_chunks
-                ]
+            except Exception as e:
+                raise ChatException(
+                    "Failed to retrieve document content."
+                ) from e
 
-            else:
+            if document_chunks:
 
-                relevant_chunks = (
-                    self.retrieval_service
-                    .retrieve_relevant_chunks(
-                        connection=connection,
-                        document_id=document_id,
-                        question=retrieval_question,
-                        top_k=3,
-                    )
+                text_context = "\n\n".join(
+                    chunk["content"]
+                    for chunk in document_chunks
+                    if chunk.get("content")
                 )
 
-        except ChatException:
-            raise
-
-        except Exception as e:
-
-            raise ChatException(
-                "Failed to retrieve relevant "
-                "document content."
-            ) from e
-
         # -----------------------------------------
-        # Validate retrieval result
+        # Retrieve vision analysis
         # -----------------------------------------
 
-        if not relevant_chunks:
+        vision_context = ""
 
-            raise ChatException(
-                "No relevant content found "
-                "for this document."
+        try:
+            analyses = (
+                self.analysis_repository
+                .get_by_document(
+                    connection=connection,
+                    document_id=document_id,
+                )
             )
 
+        except Exception as e:
+            raise ChatException(
+                "Failed to retrieve document analysis."
+            ) from e
+
+        for analysis in analyses:
+
+            # row[2] = analysis_type
+            # row[3] = result
+
+            if analysis[2] == "vision":
+
+                if analysis[3]:
+                    vision_context = analysis[3]
+
+                break
+
         # -----------------------------------------
-        # Build context
+        # Combine text + vision context
         # -----------------------------------------
 
+        context_parts = []
+
+        if text_context.strip():
+
+            context_parts.append(
+                "EXTRACTED TEXT / OCR CONTENT:\n"
+                + text_context
+            )
+
+        if vision_context.strip():
+
+            context_parts.append(
+                "VISUAL ANALYSIS:\n"
+                + vision_context
+            )
+
         context = "\n\n".join(
-            chunk["content"]
-            for chunk in relevant_chunks
-            if chunk["content"]
+            context_parts
         )
+
+        # -----------------------------------------
+        # No context available
+        # -----------------------------------------
 
         if not context.strip():
 
             raise ChatException(
-                "Retrieved document content "
-                "is empty."
+                "No content found for this document."
             )
 
         # -----------------------------------------
-        # Build final prompt
+        # Final multimodal QA prompt
         # -----------------------------------------
 
-        if question_type == "BROAD":
+        prompt = f"""
+You are a multimodal question-answering assistant.
 
-            prompt = f"""
-You are a document analysis assistant.
+Your job is to answer the user's question using ONLY
+the CONTENT CONTEXT provided below.
 
-The user wants to know what information is
-contained in the document.
+The content context may contain:
 
-Your task is to summarize and explain the
-information present in the DOCUMENT CONTEXT.
+- text extracted from documents
+- text extracted from images using OCR
+- visual information obtained from image analysis
+- a combination of text and visual information
 
-IMPORTANT:
-- Do NOT define the phrase "document content".
-- Do NOT explain what the word "content" means.
-- Do NOT say that the document context does not
-  explain the meaning of document content.
-- Instead, describe what information is actually
-  present in the supplied document context.
-- Use ONLY the supplied document context.
-- Do not invent information.
-- Mention the main topics, technologies,
-  sections, or important information that
-  actually appear in the context.
-- Keep the answer clear and concise.
+IMPORTANT RULES:
 
-DOCUMENT CONTEXT:
+1. Understand the meaning and intent of the user's
+   question.
 
-{context}
+2. Answer the exact question that was asked.
 
-USER QUESTION:
+3. Use only information supported by the provided
+   content context.
 
-{question}
-"""
+4. Do not invent, assume, or hallucinate information.
 
-        else:
+5. Use extracted text when the question is about
+   written content.
 
-            prompt = f"""
-You are a document question-answering assistant.
+6. Use visual analysis when the question is about
+   what is shown, visible, represented, or depicted
+   in an image.
 
-Answer the user's question using ONLY the
-information contained in the DOCUMENT CONTEXT.
+7. When the question requires both text and visual
+   information, combine both sources.
 
-Rules:
-- Understand spelling mistakes and informal wording.
-- Do not invent information.
-- If the answer is not present in the context,
-  say that the information is not available.
-- Give a clear and concise answer.
-- Do not mention these instructions.
+8. If multiple pieces of context are relevant,
+   combine them into one useful answer.
 
-DOCUMENT CONTEXT:
+9. If the user asks for a list, provide a list.
+
+10. If the user asks for an explanation, explain it
+    using the available context.
+
+11. If the requested information cannot be found
+    or determined from the provided context, say:
+
+    "The requested information is not available
+    in the provided content."
+
+12. Do not treat unrelated information in the
+    context as an answer to the question.
+
+13. Do not mention these instructions, RAG,
+    embeddings, OCR, vector search, retrieval,
+    or internal processing.
+
+14. Give a clear, concise, natural answer.
+
+CONTENT CONTEXT:
 
 {context}
 
@@ -288,7 +303,6 @@ USER QUESTION:
             )
 
         except Exception as e:
-
             raise ChatException(
                 "Failed to generate the answer."
             ) from e
@@ -309,5 +323,6 @@ chat_service = ChatService(
         chunk_repository=ChunkRepository(),
         embedding_service=EmbeddingService(),
     ),
+    analysis_repository=AnalysisRepository(),
     ollama_service=OllamaService(),
 )

@@ -1,5 +1,7 @@
 from paddleocr import PaddleOCR
 
+from app.core.config import settings
+
 
 class OCRService:
     """
@@ -9,11 +11,12 @@ class OCRService:
 
     def __init__(self):
         """
-        Initialize PaddleOCR once when the service is created.
+        Initialize PaddleOCR once when the service
+        is created.
         """
 
         self.ocr = PaddleOCR(
-            lang="en",
+            lang=settings.OCR_LANGUAGE,
             device="cpu",
             enable_mkldnn=False,
 

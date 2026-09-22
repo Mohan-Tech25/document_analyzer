@@ -8,7 +8,9 @@ load_dotenv()
 
 class Settings:
 
-    DATABASE_URL = os.getenv("DATABASE_URL")
+    DATABASE_URL = os.getenv(
+        "DATABASE_URL"
+    )
 
     OLLAMA_BASE_URL = os.getenv(
         "OLLAMA_BASE_URL",
@@ -20,9 +22,19 @@ class Settings:
         "llama3.2:3b"
     )
 
+    OLLAMA_VISION_MODEL = os.getenv(
+        "OLLAMA_VISION_MODEL",
+        "qwen2.5vl:3b"
+    )
+
     OLLAMA_EMBEDDING_MODEL = os.getenv(
-    "OLLAMA_EMBEDDING_MODEL",
-    "nomic-embed-text"
+        "OLLAMA_EMBEDDING_MODEL",
+        "nomic-embed-text"
+    )
+
+    OCR_LANGUAGE = os.getenv(
+        "OCR_LANGUAGE",
+        "en"
     )
 
     UPLOAD_DIR = os.getenv(
@@ -31,15 +43,24 @@ class Settings:
     )
 
     DB_POOL_MIN_SIZE = int(
-        os.getenv("DB_POOL_MIN_SIZE", "2")
+        os.getenv(
+            "DB_POOL_MIN_SIZE",
+            "2"
+        )
     )
 
     DB_POOL_MAX_SIZE = int(
-        os.getenv("DB_POOL_MAX_SIZE", "10")
+        os.getenv(
+            "DB_POOL_MAX_SIZE",
+            "10"
+        )
     )
 
     DB_POOL_TIMEOUT = float(
-        os.getenv("DB_POOL_TIMEOUT", "30")
+        os.getenv(
+            "DB_POOL_TIMEOUT",
+            "30"
+        )
     )
 
 

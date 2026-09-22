@@ -1,3 +1,5 @@
+import base64
+
 import httpx
 
 from app.core.config import settings
@@ -6,16 +8,21 @@ from app.core.exceptions import OllamaException
 
 class OllamaService:
     """
-    Handles communication with the Ollama LLM.
+    Handles communication with the Ollama LLM and
+    vision-language model.
     """
 
     def __init__(self):
         self.base_url = settings.OLLAMA_BASE_URL
         self.model = settings.OLLAMA_MODEL
+        self.vision_model = settings.OLLAMA_VISION_MODEL
 
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(
+        self,
+        prompt: str,
+    ) -> str:
         """
-        Generate a response using the configured Ollama model.
+        Generate a response using the configured Ollama text model.
         """
 
         if not prompt or not prompt.strip():
@@ -32,6 +39,7 @@ class OllamaService:
         }
 
         try:
+
             response = httpx.post(
                 url,
                 json=payload,
@@ -43,21 +51,25 @@ class OllamaService:
             data = response.json()
 
         except httpx.TimeoutException as e:
+
             raise OllamaException(
                 "Ollama request timed out."
             ) from e
 
         except httpx.HTTPStatusError as e:
+
             raise OllamaException(
                 "Ollama returned an HTTP error."
             ) from e
 
         except httpx.RequestError as e:
+
             raise OllamaException(
                 "Unable to connect to Ollama."
             ) from e
 
         except ValueError as e:
+
             raise OllamaException(
                 "Ollama returned an invalid response."
             ) from e
@@ -65,19 +77,144 @@ class OllamaService:
         response_text = data.get("response")
 
         if not response_text:
+
             raise OllamaException(
                 "Ollama returned an empty response."
             )
 
         return response_text.strip()
 
-    def understand_question(self, question: str) -> str:
+    def generate_vision_response(
+        self,
+        image_path: str,
+        prompt: str,
+    ) -> str:
+        """
+        Generate a response using the configured
+        Ollama vision-language model.
+        """
+
+        if not image_path:
+
+            raise OllamaException(
+                "Image path cannot be empty."
+            )
+
+        if not prompt or not prompt.strip():
+
+            raise OllamaException(
+                "Vision prompt cannot be empty."
+            )
+
+        # -----------------------------------------
+        # Read image
+        # -----------------------------------------
+
+        try:
+
+            with open(
+                image_path,
+                "rb",
+            ) as image_file:
+
+                image_bytes = image_file.read()
+
+            image_base64 = base64.b64encode(
+                image_bytes
+            ).decode("utf-8")
+
+        except OSError as e:
+
+            raise OllamaException(
+                "Unable to read the image file."
+            ) from e
+
+        # -----------------------------------------
+        # Ollama vision API
+        # -----------------------------------------
+
+        url = f"{self.base_url}/api/generate"
+
+        payload = {
+            "model": self.vision_model,
+            "prompt": prompt,
+            "images": [
+                image_base64
+            ],
+            "stream": False,
+            "options": {
+                "num_ctx": 8192,
+            },
+        }
+
+        try:
+
+            response = httpx.post(
+                url,
+                json=payload,
+                timeout=600.0,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+        except httpx.TimeoutException as e:
+
+            raise OllamaException(
+                "Ollama vision request timed out."
+            ) from e
+
+        except httpx.HTTPStatusError as e:
+
+            # Show the actual Ollama error temporarily
+            error_body = e.response.text.strip()
+
+            raise OllamaException(
+                f"Ollama vision HTTP error "
+                f"{e.response.status_code}: "
+                f"{error_body}"
+            ) from e
+
+        except httpx.RequestError as e:
+
+            raise OllamaException(
+                "Unable to connect to Ollama vision model."
+            ) from e
+
+        except ValueError as e:
+
+            raise OllamaException(
+                "Ollama vision model returned an invalid response."
+            ) from e
+
+        # -----------------------------------------
+        # Read Ollama response
+        # -----------------------------------------
+
+        response_text = data.get(
+            "response"
+        )
+
+        if not response_text:
+
+            raise OllamaException(
+                "Ollama vision model returned an empty response."
+            )
+
+        return response_text.strip()
+
+    def understand_question(
+        self,
+        question: str,
+    ) -> str:
         """
         Understand and normalize a user's question
         before semantic retrieval.
         """
 
         if not question or not question.strip():
+
             raise OllamaException(
                 "Question cannot be empty."
             )
@@ -90,6 +227,7 @@ Rewrite the user's question into a clear question
 while preserving the user's intended meaning.
 
 Fix:
+
 - spelling mistakes
 - typing mistakes
 - missing letters

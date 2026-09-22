@@ -1,0 +1,98 @@
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg17
+
+    container_name: document_analyzer_postgres
+
+    environment:
+      POSTGRES_DB: document_analyzer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: change_me
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    ports:
+      - "5432:5432"
+
+    restart: unless-stopped
+
+
+  ollama:
+    image: ollama/ollama:latest
+
+    container_name: document_analyzer_ollama
+
+    volumes:
+      - ollama_data:/root/.ollama
+
+    ports:
+      - "11434:11434"
+
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: document_analyzer_backend
+
+    environment:
+      DATABASE_URL: postgresql://postgres:change_me@postgres:5432/document_analyzer
+
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: llama3.2:3b
+      OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+
+      UPLOAD_DIR: uploads
+
+      DB_POOL_MIN_SIZE: 2
+      DB_POOL_MAX_SIZE: 10
+      DB_POOL_TIMEOUT: 30
+
+    volumes:
+      - uploads:/app/uploads
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      - postgres
+      - ollama
+
+    restart: unless-stopped
+
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    container_name: document_analyzer_frontend
+
+    ports:
+      - "80:80"
+
+    depends_on:
+      - backend
+
+    restart: unless-stopped
+
+
+volumes:
+  postgres_data:
+  ollama_data:
+  uploads:
+  

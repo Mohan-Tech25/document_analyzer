@@ -1,3 +1,4 @@
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -37,8 +38,14 @@ def chat_with_document(
     Ask a question about a document.
     """
 
-    return chat_service.answer_question(
+    answer = chat_service.answer_question(
         connection=connection,
         document_id=request.document_id,
         question=request.question,
+    )
+
+    return ChatResponse(
+        document_id=request.document_id,
+        question=request.question,
+        answer=answer,
     )

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from app.core.config import settings
+
 
 class FileService:
     """
@@ -15,6 +17,18 @@ class FileService:
         """
         Save uploaded file content to disk.
         """
+
+        max_file_size = (
+            settings.MAX_FILE_SIZE_MB
+            * 1024
+            * 1024
+        )
+
+        if len(file_content) > max_file_size:
+            raise ValueError(
+                f"File size exceeds the maximum "
+                f"limit of {settings.MAX_FILE_SIZE_MB} MB."
+            )
 
         path = Path(file_path)
 

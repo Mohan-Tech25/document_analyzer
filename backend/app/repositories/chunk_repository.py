@@ -1,5 +1,5 @@
 from psycopg import Connection
-from pgvector import Vector # type: ignore
+from pgvector import Vector  # type: ignore
 
 
 class ChunkRepository:
@@ -7,6 +7,10 @@ class ChunkRepository:
     Handles all database operations related
     to document chunks.
     """
+
+    # ============================================================
+    # CREATE CHUNK
+    # ============================================================
 
     def create(
         self,
@@ -46,14 +50,18 @@ class ChunkRepository:
 
         return chunk_id
 
+    # ============================================================
+    # GET ALL CHUNKS FOR A DOCUMENT
+    # ============================================================
+
     def get_by_document(
         self,
         connection: Connection,
         document_id: int,
-    ):
+    ) -> list[tuple]:
         """
-        Return all chunks belonging
-        to a document.
+        Return all chunks belonging to a document
+        in their original document order.
         """
 
         with connection.cursor() as cursor:
@@ -75,12 +83,16 @@ class ChunkRepository:
 
             return cursor.fetchall()
 
+    # ============================================================
+    # UPDATE EMBEDDING
+    # ============================================================
+
     def update_embedding(
         self,
         connection: Connection,
         chunk_id: int,
         embedding: list[float],
-    ):
+    ) -> None:
         """
         Store the embedding vector
         for a document chunk.
@@ -100,13 +112,17 @@ class ChunkRepository:
                 ),
             )
 
+    # ============================================================
+    # SIMILARITY SEARCH
+    # ============================================================
+
     def similarity_search(
         self,
         connection: Connection,
         document_id: int,
         query_embedding: list[float],
         top_k: int = 3,
-    ):
+    ) -> list[tuple]:
         """
         Find the most semantically relevant
         chunks using pgvector cosine distance.
@@ -141,5 +157,9 @@ class ChunkRepository:
 
             return cursor.fetchall()
 
+
+# ================================================================
+# SINGLETON INSTANCE
+# ================================================================
 
 chunk_repository = ChunkRepository()

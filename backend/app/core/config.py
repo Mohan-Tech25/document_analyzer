@@ -37,9 +37,21 @@ class Settings:
         "en"
     )
 
+    SCANNED_PDF_OCR_LANGUAGE = os.getenv(
+        "SCANNED_PDF_OCR_LANGUAGE",
+        "en"
+    )
+
     UPLOAD_DIR = os.getenv(
         "UPLOAD_DIR",
         "uploads"
+    )
+
+    MAX_FILE_SIZE_MB = int(
+        os.getenv(
+            "MAX_FILE_SIZE_MB",
+            "20"
+        )
     )
 
     DB_POOL_MIN_SIZE = int(
@@ -60,6 +72,33 @@ class Settings:
         os.getenv(
             "DB_POOL_TIMEOUT",
             "30"
+        )
+    )
+
+    MINERU_ENABLED = os.getenv(
+    "MINERU_ENABLED",
+    "true"
+).lower() == "true"
+
+    MINERU_COMMAND = os.getenv(
+        "MINERU_COMMAND",
+        "mineru"
+    )
+
+    MINERU_TIER = os.getenv(
+        "MINERU_TIER",
+        "standard"
+    )
+
+    MINERU_REMOTE = os.getenv(
+        "MINERU_REMOTE",
+        "true"
+    ).lower() == "true"
+
+    MINERU_TIMEOUT = int(
+        os.getenv(
+            "MINERU_TIMEOUT",
+            "300"
         )
     )
 

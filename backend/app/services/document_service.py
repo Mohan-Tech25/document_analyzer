@@ -59,6 +59,10 @@ class DocumentService:
         self.embedding_service = embedding_service
         self.file_service = file_service
 
+    # =========================================================
+    # GET ALL DOCUMENTS
+    # =========================================================
+
     def get_all_documents(
         self,
         connection: Connection,
@@ -79,6 +83,10 @@ class DocumentService:
             }
             for row in rows
         ]
+
+    # =========================================================
+    # GET DOCUMENT BY ID
+    # =========================================================
 
     def get_document_by_id(
         self,
@@ -102,6 +110,10 @@ class DocumentService:
             "status": row[5],
             "created_at": row[6],
         }
+
+    # =========================================================
+    # DELETE DOCUMENT
+    # =========================================================
 
     def delete_document(
         self,
@@ -128,12 +140,18 @@ class DocumentService:
 
         connection.commit()
 
-        self.file_service.delete_file(file_path)
+        self.file_service.delete_file(
+            file_path
+        )
 
         return {
             "document_id": document_id,
             "status": "deleted",
         }
+
+    # =========================================================
+    # PROCESS DOCUMENT
+    # =========================================================
 
     def process_document(
         self,
@@ -238,9 +256,21 @@ class DocumentService:
                 if not text or not text.strip():
                     continue
 
+                # IMPORTANT:
+                # Pass document_type here.
+                #
+                # voter_list:
+                #     one voter = one chunk
+                #
+                # other documents:
+                #     normal character chunking
+
                 chunks = (
                     self.chunking_service
-                    .chunk_text(text)
+                    .chunk_text(
+                        text=text,
+                        document_type=document_type,
+                    )
                 )
 
                 for chunk in chunks:
@@ -255,9 +285,15 @@ class DocumentService:
                         )
                     )
 
+                    # =================================
+                    # CREATE EMBEDDING
+                    # =================================
+
                     embedding = (
                         self.embedding_service
-                        .create_embedding(chunk)
+                        .create_embedding(
+                            chunk
+                        )
                     )
 
                     self.chunk_repository.update_embedding(
@@ -266,7 +302,9 @@ class DocumentService:
                         embedding=embedding,
                     )
 
-                    chunk_ids.append(chunk_id)
+                    chunk_ids.append(
+                        chunk_id
+                    )
 
                     chunks_created += 1
 
@@ -337,6 +375,10 @@ class DocumentService:
 
             raise
 
+
+# =============================================================
+# SERVICE INSTANCE
+# =============================================================
 
 document_service = DocumentService(
     document_repository=DocumentRepository(),

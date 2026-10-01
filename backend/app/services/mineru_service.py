@@ -7,7 +7,26 @@ from app.core.exceptions import DocumentExtractionException
 
 class MineruService:
 
-    def parse_document(self, file_path: str) -> dict:
+    def parse_document(
+        self,
+        file_path: str,
+    ) -> dict:
+        """
+        Parse a document using MinerU.
+
+        Returns:
+            {
+                "sha256": ...,
+                "short_id": ...,
+                "tier": ...,
+                "page_range": ...,
+                "markdown": ...
+            }
+
+        The Markdown returned by MinerU is intended to be
+        consumed by the extraction pipeline for normal PDFs.
+        """
+
         command = [
             settings.MINERU_COMMAND,
             "parse",
@@ -47,27 +66,51 @@ class MineruService:
             ) from exc
 
         if response.returncode != 0:
-            raise DocumentExtractionException(
-                f"MinerU parsing failed: {response.stderr}"
+            error_message = (
+                response.stderr.strip()
+                if response.stderr
+                else "Unknown MinerU error."
             )
 
-        if not response.stdout:
+            raise DocumentExtractionException(
+                f"MinerU parsing failed: "
+                f"{error_message}"
+            )
+
+        if not response.stdout.strip():
             raise DocumentExtractionException(
                 "MinerU returned no output."
             )
 
         try:
-            result = json.loads(response.stdout)
+            result = json.loads(
+                response.stdout
+            )
 
         except json.JSONDecodeError as exc:
             raise DocumentExtractionException(
                 "MinerU returned invalid JSON."
             ) from exc
 
-        parse_info = result.get("parse", {})
-        content = result.get("content", {})
+        parse_info = result.get(
+            "parse",
+            {},
+        )
 
-        markdown = content.get("content", "")
+        content = result.get(
+            "content",
+            {},
+        )
+
+        markdown = content.get(
+            "content",
+            "",
+        )
+
+        if not isinstance(markdown, str):
+            markdown = str(markdown)
+
+        markdown = markdown.strip()
 
         if not markdown:
             raise DocumentExtractionException(
@@ -75,10 +118,18 @@ class MineruService:
             )
 
         return {
-            "sha256": parse_info.get("sha256"),
-            "short_id": parse_info.get("short_id"),
-            "tier": parse_info.get("tier"),
-            "page_range": parse_info.get("page_range"),
+            "sha256": parse_info.get(
+                "sha256"
+            ),
+            "short_id": parse_info.get(
+                "short_id"
+            ),
+            "tier": parse_info.get(
+                "tier"
+            ),
+            "page_range": parse_info.get(
+                "page_range"
+            ),
             "markdown": markdown,
         }
 

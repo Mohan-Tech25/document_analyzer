@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 from app.core.config import settings
@@ -15,6 +16,34 @@ class ExtractionService:
     """
     Service responsible for extracting text
     from supported document types.
+
+    PDF strategy:
+
+        Normal/text PDF
+            ↓
+        MinerU
+            ↓
+        Markdown
+            ↓
+        Chunking
+
+        Scanned PDF
+            ↓
+        PaddleOCR - single pass
+            ↓
+        Is voter list?
+            ├── YES → voter record text
+            └── NO  → normal OCR text
+            ↓
+        Chunking
+
+    Images:
+
+        Image
+            ↓
+        OCR
+            ↓
+        Chunking
     """
 
     IMAGE_EXTENSIONS = {
@@ -39,15 +68,13 @@ class ExtractionService:
         file_path: str,
     ) -> dict:
         """
-        Extract optional document structure using MinerU.
+        Parse the PDF using MinerU.
 
-        MinerU is an enhancement layer.
+        Returns MinerU parsing information including
+        the Markdown representation.
 
-        Its Markdown is currently NOT merged directly
-        into OCR text because scanned voter records
-        are extracted separately using PaddleOCR.
-
-        MinerU failure does not stop document extraction.
+        MinerU failure is handled by the caller so that
+        the existing PDF/OCR extraction path can continue.
         """
 
         if not settings.MINERU_ENABLED:
@@ -79,6 +106,14 @@ class ExtractionService:
                 .strip()
             )
 
+            if not markdown:
+
+                app_logger.warning(
+                    "MinerU returned empty Markdown."
+                )
+
+                return {}
+
             mineru_result = {
                 "sha256": result.get(
                     "sha256"
@@ -99,22 +134,56 @@ class ExtractionService:
                 "MinerU extraction completed. "
                 f"SHA={mineru_result['sha256']} "
                 f"Tier={mineru_result['tier']} "
+                f"PageRange="
+                f"{mineru_result['page_range']} "
                 f"MarkdownLength="
                 f"{len(markdown)}"
             )
 
             return mineru_result
 
-        except Exception as e:
+        except Exception as exc:
 
             app_logger.warning(
                 "MinerU extraction failed. "
-                "Continuing with existing "
+                "Falling back to existing "
                 "PDF/OCR extraction. "
-                f"Error: {e}"
+                f"Error: {exc}"
             )
 
             return {}
+
+    # ------------------------------------------------------------------
+    # Determine whether PDF has embedded text
+    # ------------------------------------------------------------------
+
+    def _has_embedded_text(
+        self,
+        pages: list[dict],
+    ) -> bool:
+        """
+        Determine whether the PDF contains usable
+        embedded text.
+
+        A PDF with embedded text is treated as a
+        normal/text PDF.
+
+        A PDF with no embedded text is treated as
+        a scanned PDF.
+        """
+
+        for page in pages:
+
+            text = page.get(
+                "text",
+                "",
+            )
+
+            if text and text.strip():
+
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Main document extraction
@@ -129,35 +198,37 @@ class ExtractionService:
 
         PDF workflow:
 
-            1. Run MinerU as optional enhancement.
-            2. Try embedded PDF text page-by-page.
-            3. If a page has no embedded text:
-                   render page
-                   run PaddleOCR
-            4. For scanned voter pages:
-                   preserve page-level header/footer text
-                   preserve voter records separately.
-
-        The important voter-list structure becomes:
-
-            page header
-            voter 1
-            voter 2
-            voter 3
-            ...
-
-        This allows document-level questions such as:
-
-            "What is the constituency name?"
-
-        to retrieve the page header.
+            1. Read PDF pages with PyMuPDF.
+            2. Determine whether embedded text exists.
+            3. If normal/text PDF:
+                   use MinerU Markdown.
+            4. If scanned PDF:
+                   use PaddleOCR ONCE per page.
+                   Detect voter structure from the
+                   same OCR result.
+                   If voter list:
+                       use actual voter record text.
+                   Otherwise:
+                       use normal OCR text.
+            5. Return processed pages for chunking.
 
         Images:
 
             OCR directly.
+
+        IMPORTANT:
+
+            Only voter-list extraction is treated
+            specially here.
+
+            Normal text PDFs, scanned non-voter
+            PDFs, and images continue through their
+            existing generic extraction path.
         """
 
-        path = Path(file_path)
+        path = Path(
+            file_path
+        )
 
         if not path.exists():
 
@@ -174,15 +245,7 @@ class ExtractionService:
         if extension in self.PDF_EXTENSIONS:
 
             # ----------------------------------------------------------
-            # Optional MinerU
-            # ----------------------------------------------------------
-
-            self._extract_with_mineru(
-                str(path)
-            )
-
-            # ----------------------------------------------------------
-            # Try embedded PDF text
+            # First inspect PDF pages
             # ----------------------------------------------------------
 
             try:
@@ -194,17 +257,138 @@ class ExtractionService:
                     )
                 )
 
-            except Exception as e:
+            except Exception as exc:
 
                 raise DocumentExtractionException(
-                    "Failed to extract text from PDF."
-                ) from e
+                    "Failed to extract text "
+                    "from PDF."
+                ) from exc
+
+            if not pages:
+
+                raise DocumentExtractionException(
+                    "PDF contains no pages."
+                )
+
+            # ----------------------------------------------------------
+            # Determine whether PDF has embedded text
+            # ----------------------------------------------------------
+
+            has_embedded_text = (
+                self._has_embedded_text(
+                    pages
+                )
+            )
+
+            app_logger.info(
+                "PDF text detection completed. "
+                f"HasEmbeddedText="
+                f"{has_embedded_text}"
+            )
+
+            # ==========================================================
+            # NORMAL / TEXT PDF
+            # ==========================================================
+
+            if has_embedded_text:
+
+                app_logger.info(
+                    "PDF contains embedded text. "
+                    "Attempting MinerU extraction."
+                )
+
+                mineru_result = (
+                    self._extract_with_mineru(
+                        str(path)
+                    )
+                )
+
+                markdown = (
+                    mineru_result.get(
+                        "markdown",
+                        "",
+                    )
+                    .strip()
+                    if mineru_result
+                    else ""
+                )
+
+                # ------------------------------------------------------
+                # MinerU succeeded
+                # ------------------------------------------------------
+
+                if markdown:
+
+                    app_logger.info(
+                        "Using MinerU Markdown "
+                        "as the primary extracted "
+                        "document content."
+                    )
+
+                    return [
+                        {
+                            "page_number": None,
+                            "text": markdown,
+                        }
+                    ]
+
+                # ------------------------------------------------------
+                # MinerU failed
+                # ------------------------------------------------------
+
+                app_logger.warning(
+                    "MinerU Markdown unavailable "
+                    "for normal PDF. "
+                    "Falling back to embedded "
+                    "PDF text."
+                )
+
+                processed_pages = []
+
+                for page in pages:
+
+                    page_number = page.get(
+                        "page_number"
+                    )
+
+                    text = page.get(
+                        "text",
+                        "",
+                    )
+
+                    if (
+                        not text
+                        or not text.strip()
+                    ):
+
+                        continue
+
+                    processed_pages.append(
+                        {
+                            "page_number": page_number,
+                            "text": text.strip(),
+                        }
+                    )
+
+                if not processed_pages:
+
+                    raise DocumentExtractionException(
+                        "PDF contains no usable text."
+                    )
+
+                return processed_pages
+
+            # ==========================================================
+            # SCANNED PDF
+            # ==========================================================
+
+            app_logger.info(
+                "PDF contains no embedded text. "
+                "Treating PDF as scanned document "
+                "and using single-pass PaddleOCR."
+            )
 
             processed_pages = []
-
-            # ----------------------------------------------------------
-            # Page-by-page processing
-            # ----------------------------------------------------------
 
             try:
 
@@ -214,29 +398,9 @@ class ExtractionService:
                         "page_number"
                     ]
 
-                    text = page.get(
-                        "text",
-                        "",
-                    )
-
-                    # ==================================================
-                    # Embedded PDF text exists
-                    # ==================================================
-
-                    if text and text.strip():
-
-                        processed_pages.append(
-                            {
-                                "page_number": page_number,
-                                "text": text.strip(),
-                            }
-                        )
-
-                        continue
-
-                    # ==================================================
-                    # Scanned PDF page
-                    # ==================================================
+                    # --------------------------------------------------
+                    # Render scanned page
+                    # --------------------------------------------------
 
                     image_bytes = (
                         pdf_service
@@ -256,9 +420,9 @@ class ExtractionService:
 
                     try:
 
-                        # --------------------------------------------------
+                        # ----------------------------------------------
                         # Write temporary page image
-                        # --------------------------------------------------
+                        # ----------------------------------------------
 
                         with open(
                             temp_image_path,
@@ -269,88 +433,215 @@ class ExtractionService:
                                 image_bytes
                             )
 
-                        # --------------------------------------------------
-                        # OCR voter page
-                        # --------------------------------------------------
-                        #
-                        # IMPORTANT:
-                        #
-                        # include_page_text=True
-                        #
-                        # This preserves page headers such as:
-                        #
-                        #   சட்டமன்றத் தொகுதியின் எண் மற்றும் பெயர் :
-                        #   86-எடப்பாடி
-                        #
-                        #   பாகம் எண் : 128
-                        #
-                        #   பிரிவு எண் மற்றும் பெயர் ...
-                        #
-                        #   பட்டியல் வெளியிடப்பட்ட நாள் :
-                        #   22-01-2024
-                        #
-                        # and puts that text BEFORE voter records.
-                        # --------------------------------------------------
+                        # ----------------------------------------------
+                        # SINGLE-PASS OCR
+                        # ----------------------------------------------
 
-                        voter_records = (
+                        app_logger.info(
+                            f"Processing scanned PDF "
+                            f"page {page_number} "
+                            "with single-pass OCR."
+                        )
+
+                        scanned_result = (
                             ocr_service
-                            .extract_voter_records(
-                                str(
+                            .extract_scanned_page(
+                                image_path=str(
                                     temp_image_path
                                 ),
                                 language=(
                                     settings
                                     .SCANNED_PDF_OCR_LANGUAGE
                                 ),
-                                include_page_text=True,
+                                page_number=page_number,
                             )
                         )
 
-                        # --------------------------------------------------
-                        # Convert OCR blocks into page text
-                        # --------------------------------------------------
+                        # ----------------------------------------------
+                        # Read single-pass result
+                        # ----------------------------------------------
+
+                        is_voter_list = (
+                            scanned_result.get(
+                                "is_voter_list",
+                                False,
+                            )
+                        )
+
+                        voter_records = (
+                            scanned_result.get(
+                                "records",
+                                [],
+                            )
+                        )
 
                         ocr_text = (
-                            "\n\n".join(
-                                voter_records
+                            scanned_result.get(
+                                "text",
+                                "",
                             )
+                        )
+
+                        # ----------------------------------------------
+                        # VOTER LIST
+                        # ----------------------------------------------
+
+                        if (
+                            is_voter_list
+                            and voter_records
+                        ):
+
+                            app_logger.info(
+                                f"Voter-list structure "
+                                f"detected on page "
+                                f"{page_number}. "
+                                f"Records="
+                                f"{len(voter_records)}"
+                            )
+
+                            # IMPORTANT:
+                            #
+                            # Do NOT serialize the complete
+                            # voter dictionary using str(record).
+                            #
+                            # The previous implementation produced:
+                            #
+                            # {
+                            #     'serial_number': 45,
+                            #     'text': '...',
+                            #     ...
+                            # }
+                            #
+                            # That format caused the voter chunks
+                            # to be treated as generic text and
+                            # forced VoterRecordService to rebuild
+                            # records from serialized dictionaries.
+                            #
+                            # Store only the actual OCR text here.
+                            # ChunkingService will later perform
+                            # voter-specific chunking because
+                            # DocumentService passes document_type
+                            # to it.
+
+                            voter_texts = []
+
+                            for record in voter_records:
+
+                                if not isinstance(
+                                    record,
+                                    dict,
+                                ):
+                                    continue
+
+                                record_text = (
+                                    record.get(
+                                        "text",
+                                        "",
+                                    )
+                                )
+
+                                if not isinstance(
+                                    record_text,
+                                    str,
+                                ):
+                                    continue
+
+                                record_text = (
+                                    record_text.strip()
+                                )
+
+                                if not record_text:
+                                    continue
+
+                                voter_texts.append(
+                                    record_text
+                                )
+
+                            page_text = (
+                                "\n\n".join(
+                                    voter_texts
+                                )
+                            )
+
+                        # ----------------------------------------------
+                        # NORMAL SCANNED DOCUMENT
+                        # ----------------------------------------------
+
+                        else:
+
+                            app_logger.info(
+                                f"No voter-list "
+                                f"structure detected "
+                                f"on page "
+                                f"{page_number}. "
+                                "Using normal OCR text."
+                            )
+
+                            page_text = (
+                                ocr_text
+                            )
+
+                        # ----------------------------------------------
+                        # Store processed page
+                        # ----------------------------------------------
+
+                        processed_pages.append(
+                            {
+                                "page_number": page_number,
+                                "text": (
+                                    page_text.strip()
+                                    if page_text
+                                    else ""
+                                ),
+                            }
                         )
 
                     finally:
 
-                        # --------------------------------------------------
-                        # Delete temporary OCR image
-                        # --------------------------------------------------
+                        # ----------------------------------------------
+                        # Delete temporary image
+                        # ----------------------------------------------
 
                         if temp_image_path.exists():
 
                             try:
+
                                 temp_image_path.unlink()
 
                             except OSError:
-                                pass
 
-                    # ------------------------------------------------------
-                    # Preserve processed page
-                    # ------------------------------------------------------
+                                app_logger.warning(
+                                    "Could not delete "
+                                    "temporary OCR image: "
+                                    f"{temp_image_path}"
+                                )
 
-                    processed_pages.append(
-                        {
-                            "page_number": page_number,
-                            "text": (
-                                ocr_text.strip()
-                                if ocr_text
-                                else ""
-                            ),
-                        }
-                    )
-
-            except Exception as e:
+            except Exception as exc:
 
                 raise OCRException(
                     "Failed to extract text "
                     "from scanned PDF page."
-                ) from e
+                ) from exc
+
+            # ----------------------------------------------------------
+            # Validate scanned PDF result
+            # ----------------------------------------------------------
+
+            usable_pages = [
+                page
+                for page in processed_pages
+                if page.get(
+                    "text",
+                    "",
+                ).strip()
+            ]
+
+            if not usable_pages:
+
+                raise DocumentExtractionException(
+                    "Scanned PDF contains no "
+                    "usable OCR text."
+                )
 
             return processed_pages
 
@@ -364,8 +655,9 @@ class ExtractionService:
 
                 text = (
                     ocr_service
-                    .extract_text(
-                        str(path)
+                    .extract_document_text(
+                        image_path=str(path),
+                        language=settings.OCR_LANGUAGE,
                     )
                 )
 
@@ -376,12 +668,12 @@ class ExtractionService:
                     }
                 ]
 
-            except Exception as e:
+            except Exception as exc:
 
                 raise OCRException(
                     "Failed to extract text "
                     "from image."
-                ) from e
+                ) from exc
 
         # ==============================================================
         # Unsupported file

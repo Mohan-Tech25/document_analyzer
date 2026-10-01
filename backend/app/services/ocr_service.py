@@ -9,67 +9,69 @@ from paddleocr import PaddleOCR
 
 class OCRService:
 
-    # ------------------------------------------------------------------
-    # Patterns
-    # ------------------------------------------------------------------
+    SERIAL_PATTERN = re.compile(
+        r"^\s*(\d{1,4})\s*$"
+    )
 
-    # A serial number is an OCR box that contains ONLY 1-4 digits.
-    SERIAL_PATTERN = re.compile(r"^\s*(\d{1,4})\s*$")
+    EPIC_PATTERN = re.compile(
+        r"[A-Z]{3}\d{7}",
+        re.IGNORECASE,
+    )
 
-    # Used ONLY to print debug information. It never decides grouping.
-    EPIC_PATTERN = re.compile(r"[A-Z]{3}\d{7}", re.IGNORECASE)
-
-    # ------------------------------------------------------------------
-    # Tuning constants
-    # ------------------------------------------------------------------
+    # A normal document may contain numbers.
+    # We only consider voter-grid detection when
+    # several serial-number anchors are present.
+    MIN_SERIAL_ANCHORS_FOR_VOTER = 3
 
     COLUMN_X_TOLERANCE_FACTOR = 2.5
     ROW_Y_TOLERANCE_FACTOR = 1.5
 
     MIN_COLUMN_SHARE = 0.25
-
     COLUMN_LATTICE_TOLERANCE = 0.15
 
     MIN_ROW_SPACING_RATIO = 0.6
-
     FALLBACK_ROW_PITCH_FACTOR = 6.0
 
     TOP_TOLERANCE_FACTOR = 0.5
-
     CARD_HEIGHT_RATIO = 0.92
 
     LEFT_EDGE_SEARCH_RATIO = 0.5
-
     LEFT_EDGE_CLUSTER_RATIO = 0.04
-
     LEFT_EDGE_FALLBACK_RATIO = 0.30
 
     COLUMN_PAD_RATIO = 0.04
-
     BANNER_WIDTH_RATIO = 1.05
 
     LINE_TOLERANCE_FACTOR = 0.6
-
     MIN_ORPHAN_LINES = 3
 
-    # ------------------------------------------------------------------
-    # Initialisation
-    # ------------------------------------------------------------------
-
-    def __init__(self, debug_grouping: Optional[bool] = None):
-
+    def __init__(
+        self,
+        debug_grouping: Optional[bool] = None,
+    ):
         self._ocr_instances: dict[str, PaddleOCR] = {}
 
         if debug_grouping is None:
             debug_grouping = (
-                os.getenv("OCR_DEBUG_GROUPING", "1").strip() != "0"
+                os.getenv(
+                    "OCR_DEBUG_GROUPING",
+                    "1",
+                ).strip() != "0"
             )
 
         self.debug_grouping = debug_grouping
 
-    def _get_ocr(self, language: str = "en") -> PaddleOCR:
+    # ==========================================================
+    # OCR INSTANCE
+    # ==========================================================
+
+    def _get_ocr(
+        self,
+        language: str = "en",
+    ) -> PaddleOCR:
 
         if language not in self._ocr_instances:
+
             self._ocr_instances[language] = PaddleOCR(
                 lang=language,
                 device="cpu",
@@ -81,219 +83,453 @@ class OCRService:
 
         return self._ocr_instances[language]
 
-    # ------------------------------------------------------------------
-    # Debug helper
-    # ------------------------------------------------------------------
+    # ==========================================================
+    # SINGLE-PASS SCANNED PAGE OCR
+    # ==========================================================
 
-    def _log(self, message: str = "") -> None:
+    def extract_scanned_page(
+        self,
+        image_path: str,
+        language: str = "en",
+        page_number: int = 1,
+    ) -> dict:
 
-        if not self.debug_grouping:
-            return
+        ocr = self._get_ocr(language)
 
-        try:
-            print(message)
+        self._log(
+            f"Starting OCR for scanned page "
+            f"{page_number}."
+        )
 
-        except UnicodeEncodeError:
-            print(
-                str(message)
-                .encode("ascii", "backslashreplace")
-                .decode("ascii")
+        # PaddleOCR runs ONLY ONCE.
+        results = ocr.predict(
+            image_path
+        )
+
+        all_items = []
+
+        for result in results:
+
+            data = self._get_result_data(
+                result
             )
 
-    # ------------------------------------------------------------------
-    # PaddleOCR result helpers
-    # ------------------------------------------------------------------
+            items = self._result_to_items(
+                data
+            )
 
-    @staticmethod
-    def _unwrap_result_data(data: dict) -> dict:
+            if not items:
+                continue
+
+            all_items.extend(
+                items
+            )
+
+        if not all_items:
+
+            self._log(
+                f"No OCR text detected on page "
+                f"{page_number}."
+            )
+
+            return {
+                "is_voter_list": False,
+                "text": "",
+                "records": [],
+            }
+
+        # Assign IDs and dimensions.
+        for index, item in enumerate(
+            all_items
+        ):
+
+            item["id"] = index
+
+            item.setdefault(
+                "w",
+                item["x2"] - item["x1"],
+            )
+
+            item.setdefault(
+                "h",
+                item["y2"] - item["y1"],
+            )
+
+        self._log(
+            f"OCR completed for page "
+            f"{page_number}. "
+            f"Boxes={len(all_items)}"
+        )
+
+        # ------------------------------------------------------
+        # FIRST:
+        # Build normal OCR text.
+        # ------------------------------------------------------
+
+        ordered_items = self._reading_order(
+            all_items,
+            all_items,
+        )
+
+        normal_text = "\n".join(
+            item["text"]
+            for item in ordered_items
+            if item["text"].strip()
+        ).strip()
+
+        # ------------------------------------------------------
+        # SECOND:
+        # Quick voter-list detection.
+        # ------------------------------------------------------
+
+        anchors = self._find_serial_anchors(
+            all_items,
+            debug=False,
+        )
 
         if (
-            isinstance(data, dict)
-            and "rec_texts" not in data
-            and isinstance(data.get("res"), dict)
+            len(anchors)
+            < self.MIN_SERIAL_ANCHORS_FOR_VOTER
         ):
-            return data["res"]
 
-        return data
+            self._log(
+                f"Normal scanned document detected "
+                f"on page {page_number}. "
+                f"Serial anchors="
+                f"{len(anchors)}"
+            )
 
-    def _get_result_data(self, result: Any) -> dict:
+            return {
+                "is_voter_list": False,
+                "text": normal_text,
+                "records": [],
+            }
 
-        if result is None:
-            return {}
+        # ------------------------------------------------------
+        # POSSIBLE VOTER LIST
+        # ------------------------------------------------------
 
-        if hasattr(result, "json"):
+        self._log(
+            f"Possible voter-list structure detected "
+            f"on page {page_number}. "
+            f"SerialAnchors={len(anchors)}"
+        )
 
-            try:
-                data = result.json
+        records = (
+            self._build_voter_records_from_items(
+                items=all_items,
+                anchors=anchors,
+                page_number=page_number,
+                debug_header=True,
+            )
+        )
 
-                if callable(data):
-                    data = data()
+        if records:
 
-                if isinstance(data, dict):
-                    return self._unwrap_result_data(data)
+            self._log(
+                f"Voter-list extraction successful. "
+                f"Records={len(records)}"
+            )
 
-                if isinstance(data, list) and data:
+            return {
+                "is_voter_list": True,
+                "text": "",
+                "records": records,
+            }
 
-                    if isinstance(data[0], dict):
-                        return self._unwrap_result_data(data[0])
+        # ------------------------------------------------------
+        # GRID FAILED
+        # ------------------------------------------------------
 
-            except Exception:
-                pass
+        self._log(
+            "Possible serial numbers were found, "
+            "but voter-grid extraction failed. "
+            "Using normal OCR text."
+        )
 
-        if isinstance(result, dict):
-            return self._unwrap_result_data(result)
+        return {
+            "is_voter_list": False,
+            "text": normal_text,
+            "records": [],
+        }
 
-        return {}
+    # ==========================================================
+    # NORMAL SCANNED DOCUMENT OCR
+    # ==========================================================
 
-    # ------------------------------------------------------------------
-    # Plain text extraction
-    # ------------------------------------------------------------------
-
-    def extract_text(
+    def extract_document_text(
         self,
         image_path: str,
         language: str = "en",
     ) -> str:
 
-        ocr = self._get_ocr(language)
+        ocr = self._get_ocr(
+            language
+        )
 
-        results = ocr.predict(image_path)
+        results = ocr.predict(
+            image_path
+        )
 
-        lines = []
+        page_text_parts = []
 
         for result in results:
 
-            data = self._get_result_data(result)
+            data = self._get_result_data(
+                result
+            )
 
-            texts = data.get("rec_texts", [])
+            items = self._result_to_items(
+                data
+            )
 
-            if texts is None or len(texts) == 0:
+            if not items:
                 continue
 
-            for text in texts:
+            ordered_items = self._reading_order(
+                items,
+                items,
+            )
 
-                text = str(text).strip()
+            text = "\n".join(
+                item["text"]
+                for item in ordered_items
+                if item["text"].strip()
+            ).strip()
 
-                if text:
-                    lines.append(text)
+            if text:
 
-        return "\n".join(lines)
+                page_text_parts.append(
+                    text
+                )
 
-    # ------------------------------------------------------------------
-    # Voter record extraction
-    # ------------------------------------------------------------------
+        return "\n\n".join(
+            page_text_parts
+        ).strip()
+
+    # ==========================================================
+    # VOTER RECORD OCR
+    # ==========================================================
 
     def extract_voter_records(
         self,
         image_path: str,
         language: str = "en",
         include_page_text: bool = False,
-    ) -> list[str]:
-        """
-        Return one text block per voter card.
+    ) -> list[Any]:
 
-        Reading order:
-            page text/header
-            voter cards row-by-row, left-to-right
+        ocr = self._get_ocr(
+            language
+        )
 
-        When include_page_text=False:
-            Only voter records are returned.
+        results = ocr.predict(
+            image_path
+        )
 
-        When include_page_text=True:
-            Page-level text such as:
-                - constituency
-                - part number
-                - section name
-                - publication date
-                - page number
-                - footer/header
+        records = []
 
-            is returned as the FIRST block.
+        for page_number, result in enumerate(
+            results,
+            start=1,
+        ):
 
-        This is important because page metadata must reach the
-        document chunking/retrieval pipeline.
-        """
+            data = self._get_result_data(
+                result
+            )
 
-        ocr = self._get_ocr(language)
-
-        results = ocr.predict(image_path)
-
-        records: list[str] = []
-
-        # Each result is one page.
-        for page_number, result in enumerate(results, start=1):
-
-            data = self._get_result_data(result)
-
-            items = self._result_to_items(data)
+            items = self._result_to_items(
+                data
+            )
 
             if not items:
                 continue
 
-            page_records = self._build_voter_records(
-                items=items,
-                include_page_text=include_page_text,
-                page_number=page_number,
+            page_records = (
+                self._build_voter_records(
+                    items=items,
+                    include_page_text=include_page_text,
+                    page_number=page_number,
+                )
             )
 
-            records.extend(page_records)
+            records.extend(
+                page_records
+            )
 
         return records
 
-    # ------------------------------------------------------------------
-    # OCR result -> list of boxes
-    # ------------------------------------------------------------------
+    # ==========================================================
+    # RESULT DATA EXTRACTION
+    # ==========================================================
+
+    def _get_result_data(
+        self,
+        result: Any,
+    ) -> dict:
+
+        if isinstance(
+            result,
+            dict,
+        ):
+            return result
+
+        if hasattr(
+            result,
+            "json",
+        ):
+
+            try:
+
+                value = result.json()
+
+                if isinstance(
+                    value,
+                    dict,
+                ):
+
+                    return value
+
+            except Exception:
+                pass
+
+        if hasattr(
+            result,
+            "to_json",
+        ):
+
+            try:
+
+                value = result.to_json()
+
+                if isinstance(
+                    value,
+                    str,
+                ):
+
+                    import json
+
+                    value = json.loads(
+                        value
+                    )
+
+                if isinstance(
+                    value,
+                    dict,
+                ):
+
+                    return value
+
+            except Exception:
+                pass
+
+        return {}
+
+    # ==========================================================
+    # CONVERT PADDLE RESULT TO ITEMS
+    # ==========================================================
 
     def _result_to_items(
         self,
         data: dict,
     ) -> list[dict]:
-        """
-        Convert PaddleOCR output into:
 
-            text
-            x1
-            y1
-            x2
-            y2
-            x
-            y
-            w
-            h
-            id
-        """
+        items = []
 
-        rec_texts = data.get("rec_texts")
-        rec_boxes = data.get("rec_boxes")
-        rec_polys = data.get("rec_polys")
+        rec_texts = data.get(
+            "rec_texts",
+            [],
+        )
 
-        if rec_texts is None or len(rec_texts) == 0:
-            return []
+        rec_scores = data.get(
+            "rec_scores",
+            [],
+        )
 
-        items: list[dict] = []
+        rec_polys = data.get(
+            "rec_polys",
+            [],
+        )
 
-        for index, text in enumerate(rec_texts):
+        if (
+            rec_texts is None
+            or len(rec_texts) == 0
+        ):
 
-            text = str(text).strip()
+            return items
+
+        for index, text in enumerate(
+            rec_texts
+        ):
+
+            if text is None:
+                continue
+
+            text = str(
+                text
+            ).strip()
 
             if not text:
                 continue
 
-            box = self._get_box(
-                rec_boxes,
-                rec_polys,
-                index,
-            )
+            score = None
 
-            if box is None:
+            if (
+                rec_scores is not None
+                and index < len(rec_scores)
+            ):
+
+                try:
+
+                    score = float(
+                        rec_scores[index]
+                    )
+
+                except Exception:
+
+                    score = None
+
+            polygon = None
+
+            if (
+                rec_polys is not None
+                and index < len(rec_polys)
+            ):
+
+                polygon = rec_polys[
+                    index
+                ]
+
+            if polygon is None:
                 continue
 
-            x1, y1, x2, y2 = box
+            try:
+
+                xs = [
+                    float(point[0])
+                    for point in polygon
+                ]
+
+                ys = [
+                    float(point[1])
+                    for point in polygon
+                ]
+
+                if not xs or not ys:
+                    continue
+
+                x1 = min(xs)
+                y1 = min(ys)
+                x2 = max(xs)
+                y2 = max(ys)
+
+            except Exception:
+
+                continue
 
             items.append(
                 {
-                    "id": len(items),
                     "text": text,
+                    "score": score,
                     "x1": x1,
                     "y1": y1,
                     "x2": x2,
@@ -307,136 +543,20 @@ class OCRService:
 
         return items
 
-    @staticmethod
-    def _get_box(
-        rec_boxes,
-        rec_polys,
-        index: int,
-    ):
-        """
-        Return:
-
-            (x1, y1, x2, y2)
-
-        Uses rec_boxes first and rec_polys as fallback.
-        """
-
-        try:
-
-            if (
-                rec_boxes is not None
-                and index < len(rec_boxes)
-            ):
-
-                box = rec_boxes[index]
-
-                xs = [
-                    float(box[0]),
-                    float(box[2]),
-                ]
-
-                ys = [
-                    float(box[1]),
-                    float(box[3]),
-                ]
-
-                return (
-                    min(xs),
-                    min(ys),
-                    max(xs),
-                    max(ys),
-                )
-
-        except Exception:
-            pass
-
-        try:
-
-            if (
-                rec_polys is not None
-                and index < len(rec_polys)
-            ):
-
-                points = rec_polys[index]
-
-                xs = [
-                    float(point[0])
-                    for point in points
-                ]
-
-                ys = [
-                    float(point[1])
-                    for point in points
-                ]
-
-                return (
-                    min(xs),
-                    min(ys),
-                    max(xs),
-                    max(ys),
-                )
-
-        except Exception:
-            pass
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Small generic helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _cluster_by_value(
-        entries: list[dict],
-        key: str,
-        tolerance: float,
-    ):
-
-        clusters: list[list[dict]] = []
-
-        for entry in sorted(
-            entries,
-            key=lambda e: e[key],
-        ):
-
-            if (
-                clusters
-                and (
-                    entry[key]
-                    - clusters[-1][-1][key]
-                )
-                <= tolerance
-            ):
-
-                clusters[-1].append(entry)
-
-            else:
-                clusters.append([entry])
-
-        return clusters
-
-    @staticmethod
-    def _median(values) -> float:
-
-        return float(
-            statistics.median(
-                list(values)
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # Main grouping pipeline
-    # ------------------------------------------------------------------
+    # ==========================================================
+    # BUILD VOTER RECORDS
+    # ==========================================================
 
     def _build_voter_records(
         self,
         items: list[dict],
         include_page_text: bool = False,
         page_number: int = 1,
-    ) -> list[str]:
+    ) -> list[Any]:
 
-        # Make sure every item has required fields.
-        for index, item in enumerate(items):
+        for index, item in enumerate(
+            items
+        ):
 
             item["id"] = index
 
@@ -452,31 +572,34 @@ class OCRService:
 
         self._log()
 
-        self._log("=" * 72)
+        self._log(
+            "=" * 72
+        )
 
         self._log(
             f"VOTER GRID DEBUG - page {page_number} "
             f"({len(items)} OCR boxes)"
         )
 
-        self._log("=" * 72)
+        self._log(
+            "=" * 72
+        )
 
-        # ==============================================================
-        # STEP 1
-        # Find serial-number anchors
-        # ==============================================================
+        anchors = self._find_serial_anchors(
+            items,
+            debug=False,
+        )
 
-        anchors = self._find_serial_anchors(items)
-
-        if not anchors:
+        if (
+            len(anchors)
+            < self.MIN_SERIAL_ANCHORS_FOR_VOTER
+        ):
 
             self._log(
-                "No serial-number boxes found -> "
-                "no voter cards."
+                "Not enough serial-number boxes "
+                "to consider this a voter page."
             )
 
-            # If this page contains no voter cards, preserve
-            # the complete OCR text as page-level text.
             if include_page_text:
 
                 ordered_items = self._reading_order(
@@ -490,109 +613,149 @@ class OCRService:
                 ).strip()
 
                 if page_text:
-                    return [page_text]
+
+                    return [
+                        page_text
+                    ]
 
             return []
 
-        # ==============================================================
-        # STEP 2 + 3
-        # Detect grid
-        # ==============================================================
+        return self._build_voter_records_from_items(
+            items=items,
+            anchors=anchors,
+            page_number=page_number,
+            debug_header=False,
+        )
+
+    # ==========================================================
+    # BUILD VOTER RECORDS FROM OCR ITEMS
+    # ==========================================================
+
+    def _build_voter_records_from_items(
+        self,
+        items: list[dict],
+        anchors: list[dict],
+        page_number: int = 1,
+        debug_header: bool = True,
+    ) -> list[dict]:
+
+        if not items:
+            return []
+
+        if not anchors:
+            return []
+
+        for index, item in enumerate(
+            items
+        ):
+
+            item["id"] = index
+
+            item.setdefault(
+                "w",
+                item["x2"] - item["x1"],
+            )
+
+            item.setdefault(
+                "h",
+                item["y2"] - item["y1"],
+            )
+
+        if debug_header:
+
+            self._log()
+
+            self._log(
+                "=" * 72
+            )
+
+            self._log(
+                f"VOTER GRID DEBUG - page {page_number} "
+                f"({len(items)} OCR boxes)"
+            )
+
+            self._log(
+                "=" * 72
+            )
 
         grid = self._detect_grid(
-            anchors,
             items,
+            anchors,
         )
 
-        # ==============================================================
-        # STEP 4 + 5
-        # Build card rectangles and assign OCR boxes
-        # ==============================================================
+        if not grid:
 
-        cells, page_text = (
-            self._assign_items_to_cells(
-                items,
-                grid,
+            self._log(
+                "Grid detection failed."
             )
-        )
 
-        # ==============================================================
-        # STEP 6
-        # Format voter cards
-        # ==============================================================
+            return []
+
+        cells = self._assign_items_to_cells(
+            items,
+            grid,
+        )
 
         records = self._format_cards(
             cells,
             grid,
-            items,
         )
 
-        # ==============================================================
-        # PAGE-LEVEL TEXT
-        # ==============================================================
-        #
-        # IMPORTANT:
-        #
-        # Page text is inserted BEFORE voter records.
-        #
-        # Example:
-        #
-        #     constituency header
-        #     part number
-        #     section name
-        #     publication date
-        #
-        #     voter 1
-        #     voter 2
-        #     voter 3
-        #
-        # This allows ChunkingService to create a dedicated
-        # document-level chunk.
-        # ==============================================================
+        self._log_grid(
+            grid
+        )
 
-        if include_page_text and page_text:
-
-            ordered_page_text = self._reading_order(
-                page_text,
-                items,
-            )
-
-            page_text_block = "\n".join(
-                item["text"]
-                for item in ordered_page_text
-            ).strip()
-
-            if page_text_block:
-
-                records.insert(
-                    0,
-                    page_text_block,
-                )
-
-        # Debug information.
         self._log_summary(
-            cells,
-            page_text,
+            records
         )
 
         return records
 
-    # ------------------------------------------------------------------
-    # STEP 1 - serial anchors
-    # ------------------------------------------------------------------
+    # ==========================================================
+    # SERIAL ANCHOR DETECTION
+    # ==========================================================
 
     def _find_serial_anchors(
         self,
         items: list[dict],
+        debug: bool = False,
     ) -> list[dict]:
 
         anchors = []
 
-        for item in items:
+        if debug:
+
+            self._log()
+
+            self._log(
+                "---------- SERIAL ANCHOR DEBUG ----------"
+            )
+
+        for item in sorted(
+            items,
+            key=lambda item: (
+                item["y"],
+                item["x"],
+            ),
+        ):
+
+            text = item["text"]
 
             match = self.SERIAL_PATTERN.match(
-                item["text"]
+                text
             )
+
+            if debug:
+
+                self._log(
+                    f"TEXT={text!r} "
+                    f"X={item['x']:.1f} "
+                    f"Y={item['y']:.1f} "
+                    f"W={item['w']:.1f} "
+                    f"H={item['h']:.1f} "
+                    f"MATCH="
+                    f"{'YES' if match else 'NO'}"
+                )
 
             if not match:
                 continue
@@ -605,1077 +768,1221 @@ class OCRService:
 
                 item["serial"] = serial
 
-                anchors.append(item)
-
-        return anchors
-
-    # ------------------------------------------------------------------
-    # STEP 2 + 3 - grid detection
-    # ------------------------------------------------------------------
-
-    def _detect_grid(
-        self,
-        anchors: list[dict],
-        items: list[dict],
-    ) -> dict:
-
-        median_h = (
-            self._median(
-                a["h"]
-                for a in anchors
-            )
-            or 1.0
-        )
-
-        # --------------------------------------------------------------
-        # Columns
-        # --------------------------------------------------------------
-
-        col_clusters = (
-            self._cluster_by_value(
-                anchors,
-                "x",
-                self.COLUMN_X_TOLERANCE_FACTOR
-                * median_h,
-            )
-        )
-
-        largest = max(
-            len(cluster)
-            for cluster in col_clusters
-        )
-
-        min_members = max(
-            1,
-            math.ceil(
-                self.MIN_COLUMN_SHARE
-                * largest
-            ),
-        )
-
-        col_clusters = [
-            cluster
-            for cluster in col_clusters
-            if len(cluster) >= min_members
-        ]
-
-        col_clusters = (
-            self._keep_lattice_columns(
-                col_clusters
-            )
-        )
-
-        col_clusters.sort(
-            key=lambda c: self._median(
-                a["x"]
-                for a in c
-            )
-        )
-
-        columns = [
-            {
-                "x": self._median(
-                    a["x"]
-                    for a in cluster
-                ),
-                "anchors": cluster,
-            }
-            for cluster in col_clusters
-        ]
-
-        grid_anchors = [
-            a
-            for cluster in col_clusters
-            for a in cluster
-        ]
-
-        # --------------------------------------------------------------
-        # Rows
-        # --------------------------------------------------------------
-
-        row_clusters = (
-            self._cluster_by_value(
-                grid_anchors,
-                "y",
-                self.ROW_Y_TOLERANCE_FACTOR
-                * median_h,
-            )
-        )
-
-        rows = [
-            {
-                "y": self._median(
-                    a["y"]
-                    for a in cluster
-                ),
-                "anchors": cluster,
-            }
-            for cluster in row_clusters
-        ]
-
-        rows.sort(
-            key=lambda r: r["y"]
-        )
-
-        fallback_pitch_y = (
-            self.FALLBACK_ROW_PITCH_FACTOR
-            * median_h
-        )
-
-        if len(rows) >= 2:
-
-            pitch_y = self._median(
-                rows[i + 1]["y"]
-                - rows[i]["y"]
-                for i in range(
-                    len(rows) - 1
-                )
-            )
-
-            kept_rows = [rows[0]]
-
-            for row in rows[1:]:
-
-                if (
-                    row["y"]
-                    - kept_rows[-1]["y"]
-                    >= (
-                        self.MIN_ROW_SPACING_RATIO
-                        * pitch_y
-                    )
-                ):
-                    kept_rows.append(row)
-
-            rows = kept_rows
-
-            if len(rows) >= 2:
-
-                pitch_y = self._median(
-                    rows[i + 1]["y"]
-                    - rows[i]["y"]
-                    for i in range(
-                        len(rows) - 1
-                    )
+                anchors.append(
+                    item
                 )
 
-            else:
-                pitch_y = fallback_pitch_y
+        if debug:
 
-        else:
-            pitch_y = fallback_pitch_y
-
-        # --------------------------------------------------------------
-        # Cell ownership
-        # --------------------------------------------------------------
-
-        col_index_of = {
-            a["id"]: c_idx
-            for c_idx, column in enumerate(columns)
-            for a in column["anchors"]
-        }
-
-        row_index_of = {
-            a["id"]: r_idx
-            for r_idx, row in enumerate(rows)
-            for a in row["anchors"]
-        }
-
-        anchor_by_cell: dict[
-            tuple,
-            dict,
-        ] = {}
-
-        rejected_anchors: list[dict] = []
-
-        for anchor in sorted(
-            grid_anchors,
-            key=lambda a: (
-                a["y"],
-                a["x"],
-            ),
-        ):
-
-            if anchor["id"] not in row_index_of:
-
-                rejected_anchors.append(
-                    anchor
-                )
-
-                continue
-
-            cell = (
-                row_index_of[
-                    anchor["id"]
-                ],
-                col_index_of[
-                    anchor["id"]
-                ],
-            )
-
-            if cell in anchor_by_cell:
-
-                rejected_anchors.append(
-                    anchor
-                )
-
-            else:
-
-                anchor_by_cell[cell] = (
-                    anchor
-                )
-
-        used_ids = {
-            a["id"]
-            for a in anchor_by_cell.values()
-        }
-
-        rejected_anchors.extend(
-            a
-            for a in anchors
-            if (
-                a["id"] not in used_ids
-                and a not in rejected_anchors
-            )
-        )
-
-        # --------------------------------------------------------------
-        # Horizontal geometry
-        # --------------------------------------------------------------
-
-        pitch_x = None
-
-        if len(columns) >= 2:
-
-            pitch_x = self._median(
-                columns[i + 1]["x"]
-                - columns[i]["x"]
-                for i in range(
-                    len(columns) - 1
-                )
-            )
-
-        page_width = (
-            max(
-                item["x2"]
-                for item in items
-            )
-            - min(
-                item["x1"]
-                for item in items
-            )
-        )
-
-        reference_width = (
-            pitch_x
-            if pitch_x
-            else page_width
-        )
-
-        banner_limit = (
-            self.BANNER_WIDTH_RATIO
-            * pitch_x
-            if pitch_x
-            else None
-        )
-
-        left_offset, edge_count = (
-            self._estimate_left_edge_offset(
-                items=items,
-                columns=columns,
-                anchor_ids=used_ids,
-                reference_width=reference_width,
-                banner_limit=banner_limit,
-            )
-        )
-
-        if left_offset is None:
-
-            left_offset = (
-                -self.LEFT_EDGE_FALLBACK_RATIO
-                * reference_width
+            self._log(
+                f"Serial anchors detected: "
+                f"{len(anchors)}"
             )
 
             self._log(
-                "WARNING: could not measure "
-                "the card left edge; "
-                "using a default guess."
+                "------------------------------------------"
             )
 
-        pad = (
-            self.COLUMN_PAD_RATIO
-            * reference_width
-        )
+            self._log()
 
-        for column in columns:
+        return anchors
 
-            column["left"] = (
-                column["x"]
-                + left_offset
-            )
+    # ==========================================================
+    # GRID DETECTION
+    # ==========================================================
 
-            column["bound_left"] = (
-                column["left"]
-                - pad
-            )
-
-        right_limit = (
-            columns[-1]["left"]
-            + pitch_x
-            if pitch_x
-            else float("inf")
-        )
-
-        # --------------------------------------------------------------
-        # Vertical geometry
-        # --------------------------------------------------------------
-
-        top_tolerance = (
-            self.TOP_TOLERANCE_FACTOR
-            * median_h
-        )
-
-        for index, row in enumerate(rows):
-
-            row["top"] = (
-                row["y"]
-                - top_tolerance
-            )
-
-            bottom = (
-                row["y"]
-                + self.CARD_HEIGHT_RATIO
-                * pitch_y
-            )
-
-            if index + 1 < len(rows):
-
-                bottom = min(
-                    bottom,
-                    rows[index + 1]["y"]
-                    - top_tolerance,
-                )
-
-            row["bottom"] = bottom
-
-        grid = {
-            "columns": columns,
-            "rows": rows,
-            "pitch_x": pitch_x,
-            "pitch_y": pitch_y,
-            "median_h": median_h,
-            "left_offset": left_offset,
-            "right_limit": right_limit,
-            "banner_limit": banner_limit,
-            "anchor_by_cell": anchor_by_cell,
-        }
-
-        self._log_grid(
-            grid,
-            len(anchors),
-            len(anchor_by_cell),
-            edge_count,
-        )
-
-        return grid
-
-    def _keep_lattice_columns(
+    def _detect_grid(
         self,
-        col_clusters: list[list[dict]],
-    ):
+        items: list[dict],
+        anchors: list[dict],
+    ) -> Optional[dict]:
 
-        largest = max(
-            len(c)
-            for c in col_clusters
-        )
+        if not anchors:
+            return None
 
-        strong = [
-            c
-            for c in col_clusters
-            if len(c) >= 0.5 * largest
+        anchor_heights = [
+            anchor["h"]
+            for anchor in anchors
+            if anchor["h"] > 0
         ]
 
-        if len(strong) < 2:
-            return col_clusters
+        if not anchor_heights:
+            return None
 
-        strong_x = sorted(
-            self._median(
-                a["x"]
-                for a in c
-            )
-            for c in strong
+        median_height = statistics.median(
+            anchor_heights
         )
 
-        pitch = self._median(
-            strong_x[i + 1]
-            - strong_x[i]
-            for i in range(
-                len(strong_x) - 1
+        x_values = [
+            anchor["x"]
+            for anchor in anchors
+        ]
+
+        y_values = [
+            anchor["y"]
+            for anchor in anchors
+        ]
+
+        columns = self._cluster_values(
+            x_values,
+            median_height
+            * self.COLUMN_X_TOLERANCE_FACTOR,
+            axis="x",
+        )
+
+        if not columns:
+            return None
+
+        rows = self._cluster_values(
+            y_values,
+            median_height
+            * self.ROW_Y_TOLERANCE_FACTOR,
+            axis="y",
+        )
+
+        if not rows:
+            return None
+
+        columns = [
+            column
+            for column in columns
+            if len(column)
+            >= max(
+                1,
+                int(
+                    len(anchors)
+                    * self.MIN_COLUMN_SHARE
+                ),
+            )
+        ]
+
+        if not columns:
+            return None
+
+        column_centers = [
+            statistics.mean(
+                value["x"]
+                for value in column
+            )
+            for column in columns
+        ]
+
+        column_centers.sort()
+
+        row_centers = [
+            statistics.mean(
+                value["y"]
+                for value in row
+            )
+            for row in rows
+        ]
+
+        row_centers.sort()
+
+        row_pitch = self._estimate_row_pitch(
+            row_centers,
+            median_height,
+        )
+
+        if row_pitch <= 0:
+
+            row_pitch = (
+                median_height
+                * self.FALLBACK_ROW_PITCH_FACTOR
+            )
+
+        card_width = self._estimate_card_width(
+            column_centers,
+            items,
+        )
+
+        card_height = (
+            row_pitch
+            * self.CARD_HEIGHT_RATIO
+        )
+
+        # ------------------------------------------------------
+        # NEW:
+        #
+        # The serial anchors are normally positioned near the
+        # LEFT side of each voter card.
+        #
+        # Therefore we must not treat the serial position as
+        # the physical center of the card.
+        #
+        # Build horizontal boundaries between neighboring
+        # serial columns instead.
+        # ------------------------------------------------------
+
+        column_boundaries = (
+            self._build_column_boundaries(
+                column_centers,
+                items,
             )
         )
 
-        if pitch <= 0:
-            return col_clusters
+        row_boundaries = (
+            self._build_row_boundaries(
+                row_centers,
+                row_pitch,
+            )
+        )
 
-        kept = []
+        return {
+            "columns": column_centers,
+            "rows": row_centers,
+            "row_pitch": row_pitch,
+            "card_width": card_width,
+            "card_height": card_height,
+            "column_boundaries": column_boundaries,
+            "row_boundaries": row_boundaries,
+            "median_anchor_height": median_height,
+        }
 
-        for cluster in col_clusters:
+    # ==========================================================
+    # COLUMN BOUNDARIES
+    # ==========================================================
 
-            cx = self._median(
-                a["x"]
-                for a in cluster
+    def _build_column_boundaries(
+        self,
+        column_centers: list[float],
+        items: list[dict],
+    ) -> list[tuple[float, float]]:
+
+        if not column_centers:
+            return []
+
+        centers = sorted(column_centers)
+
+        if len(centers) == 1:
+
+            widths = [
+                item.get("w", 0)
+                for item in items
+                if item.get("w", 0) > 0
+            ]
+
+            if widths:
+                estimated_width = (
+                    statistics.median(widths) * 12
+                )
+            else:
+                estimated_width = 500.0
+
+            center = centers[0]
+
+            return [
+                (
+                    center - estimated_width * 0.35,
+                    center + estimated_width * 0.65,
+                )
+            ]
+
+        # ------------------------------------------------------
+        # Estimate horizontal distance between serial anchors.
+        #
+        # The serial number is NOT the center of the voter card.
+        # In this voter-list layout it is positioned toward the
+        # right side of the card.
+        # ------------------------------------------------------
+
+        spacings = [
+            centers[index + 1] - centers[index]
+            for index in range(len(centers) - 1)
+            if centers[index + 1] > centers[index]
+        ]
+
+        if not spacings:
+            return []
+
+        column_pitch = statistics.median(spacings)
+
+        # ------------------------------------------------------
+        # Estimate the physical card position.
+        #
+        # Observed layout:
+        #
+        #     card left
+        #          |
+        #          |------ serial
+        #          |
+        #
+        # The serial anchor is approximately 1/3 of a card
+        # width from the physical left edge.
+        #
+        # This is derived from the repeated OCR geometry rather
+        # than using page-specific x coordinates.
+        # ------------------------------------------------------
+
+        serial_left_offset = column_pitch * 0.33
+
+        # The remaining part of the card is to the right
+        # of the serial anchor.
+        serial_right_offset = column_pitch - serial_left_offset
+
+        boundaries = []
+
+        for index, center in enumerate(centers):
+
+            left = (
+                center
+                - serial_left_offset
             )
 
-            distance = abs(
-                cx - strong_x[0]
+            right = (
+                center
+                + serial_right_offset
             )
 
-            whole = round(
-                distance / pitch
+            boundaries.append(
+                (
+                    left,
+                    right,
+                )
+            )
+
+        # ------------------------------------------------------
+        # Make neighboring boundaries meet exactly.
+        #
+        # This prevents gaps/overlaps caused by small OCR
+        # variations in serial positions.
+        # ------------------------------------------------------
+
+        for index in range(
+            len(boundaries) - 1
+        ):
+
+            left_boundary = (
+                boundaries[index][0]
+            )
+
+            right_boundary = (
+                boundaries[index + 1][1]
+            )
+
+            shared_boundary = (
+                boundaries[index][1]
+                + boundaries[index + 1][0]
+            ) / 2
+
+            boundaries[index] = (
+                left_boundary,
+                shared_boundary,
+            )
+
+            boundaries[index + 1] = (
+                shared_boundary,
+                right_boundary,
+            )
+
+        return boundaries
+    # ==========================================================
+    # ROW BOUNDARIES
+    # ==========================================================
+
+    def _build_row_boundaries(
+        self,
+        row_centers: list[float],
+        row_pitch: float,
+    ) -> list[tuple[float, float]]:
+
+        if not row_centers:
+            return []
+
+        if len(row_centers) == 1:
+
+            center = row_centers[0]
+
+            half_height = (
+                row_pitch * 0.5
+            )
+
+            return [
+                (
+                    center - half_height,
+                    center + half_height,
+                )
+            ]
+
+        internal_boundaries = []
+
+        for index in range(
+            len(row_centers) - 1
+        ):
+
+            top = row_centers[index]
+            bottom = row_centers[index + 1]
+
+            internal_boundaries.append(
+                (top + bottom) / 2
+            )
+
+        first_spacing = (
+            row_centers[1]
+            - row_centers[0]
+        )
+
+        last_spacing = (
+            row_centers[-1]
+            - row_centers[-2]
+        )
+
+        top_edge = (
+            row_centers[0]
+            - first_spacing * 0.50
+        )
+
+        bottom_edge = (
+            row_centers[-1]
+            + last_spacing * 0.50
+        )
+
+        boundaries = []
+
+        boundaries.append(
+            (
+                top_edge,
+                internal_boundaries[0],
+            )
+        )
+
+        for index in range(
+            len(internal_boundaries) - 1
+        ):
+
+            boundaries.append(
+                (
+                    internal_boundaries[index],
+                    internal_boundaries[index + 1],
+                )
+            )
+
+        boundaries.append(
+            (
+                internal_boundaries[-1],
+                bottom_edge,
+            )
+        )
+
+        return boundaries
+
+    # ==========================================================
+    # CLUSTER VALUES
+    # ==========================================================
+
+    def _cluster_values(
+        self,
+        values: list[float],
+        tolerance: float,
+        axis: str = "x",
+    ) -> list[list[dict]]:
+
+        if not values:
+            return []
+
+        if axis not in {"x", "y"}:
+            raise ValueError(
+                f"Unsupported clustering axis: {axis}"
+            )
+
+        sorted_values = sorted(
+            values
+        )
+
+        clusters = []
+
+        current = [
+            {
+                axis: sorted_values[0],
+            }
+        ]
+
+        for value in sorted_values[1:]:
+
+            center = statistics.mean(
+                item[axis]
+                for item in current
             )
 
             if abs(
-                distance
-                - whole * pitch
-            ) <= (
-                self.COLUMN_LATTICE_TOLERANCE
-                * pitch
-            ):
+                value - center
+            ) <= tolerance:
 
-                kept.append(cluster)
-
-        return (
-            kept
-            or col_clusters
-        )
-
-    def _estimate_left_edge_offset(
-        self,
-        items: list[dict],
-        columns: list[dict],
-        anchor_ids: set,
-        reference_width: float,
-        banner_limit: Optional[float],
-    ):
-
-        search = (
-            self.LEFT_EDGE_SEARCH_RATIO
-            * reference_width
-        )
-
-        offsets = []
-
-        for item in items:
-
-            if item["id"] in anchor_ids:
-                continue
-
-            if (
-                banner_limit is not None
-                and item["w"] > banner_limit
-            ):
-                continue
-
-            for column in columns:
-
-                distance = (
-                    item["x1"]
-                    - column["x"]
+                current.append(
+                    {
+                        axis: value
+                    }
                 )
 
-                if (
-                    -search
-                    <= distance
-                    <= 0
-                ):
-                    offsets.append(
-                        distance
-                    )
+            else:
 
-        if not offsets:
-            return None, 0
+                clusters.append(
+                    current
+                )
 
-        offsets.sort()
+                current = [
+                    {
+                        axis: value
+                    }
+                ]
 
-        window = (
-            self.LEFT_EDGE_CLUSTER_RATIO
-            * reference_width
+        clusters.append(
+            current
         )
 
-        best_count = 0
-        best_start = 0
-        best_end = 0
+        return clusters
 
-        start = 0
+    # ==========================================================
+    # ROW PITCH
+    # ==========================================================
 
-        for end in range(
-            len(offsets)
-        ):
+    def _estimate_row_pitch(
+        self,
+        row_centers: list[float],
+        median_height: float,
+    ) -> float:
 
-            while (
-                offsets[end]
-                - offsets[start]
-                > window
-            ):
-                start += 1
+        if len(row_centers) < 2:
 
-            count = (
-                end
-                - start
-                + 1
+            return (
+                median_height
+                * self.FALLBACK_ROW_PITCH_FACTOR
             )
 
-            if count >= best_count:
+        differences = [
+            row_centers[index + 1]
+            - row_centers[index]
+            for index in range(
+                len(row_centers) - 1
+            )
+            if row_centers[index + 1]
+            > row_centers[index]
+        ]
 
-                best_count = count
-                best_start = start
-                best_end = end
+        if not differences:
 
-        return (
-            self._median(
-                offsets[
-                    best_start:
-                    best_end + 1
-                ]
-            ),
-            best_count,
+            return (
+                median_height
+                * self.FALLBACK_ROW_PITCH_FACTOR
+            )
+
+        median_difference = statistics.median(
+            differences
         )
 
-    # ------------------------------------------------------------------
-    # STEP 4 + 5 - card rectangles and assignment
-    # ------------------------------------------------------------------
+        valid = [
+            difference
+            for difference in differences
+            if difference
+            >= (
+                median_difference
+                * self.MIN_ROW_SPACING_RATIO
+            )
+        ]
 
-    @staticmethod
-    def _locate_cell(
-        item: dict,
-        grid: dict,
-    ):
+        if not valid:
+            return median_difference
 
-        columns = grid["columns"]
-        rows = grid["rows"]
+        return statistics.median(
+            valid
+        )
 
-        cx = item["x"]
-        cy = item["y"]
+    # ==========================================================
+    # CARD WIDTH
+    # ==========================================================
 
-        if (
-            cx < columns[0]["bound_left"]
-            or cx >= grid["right_limit"]
-        ):
-            return None
+    def _estimate_card_width(
+        self,
+        column_centers: list[float],
+        items: list[dict],
+    ) -> float:
 
-        column_index = 0
+        if len(column_centers) >= 2:
 
-        for index, column in enumerate(
-            columns
-        ):
+            differences = [
+                column_centers[index + 1]
+                - column_centers[index]
+                for index in range(
+                    len(column_centers) - 1
+                )
+            ]
 
-            if (
-                cx
-                >= column["bound_left"]
-            ):
-                column_index = index
+            if differences:
 
-        for index, row in enumerate(
-            rows
-        ):
-
-            if (
-                row["top"]
-                <= cy
-                < row["bottom"]
-            ):
-                return (
-                    index,
-                    column_index,
+                return statistics.median(
+                    differences
                 )
 
-        return None
+        widths = [
+            item["w"]
+            for item in items
+            if item["w"] > 0
+        ]
+
+        if widths:
+
+            return (
+                statistics.median(
+                    widths
+                )
+                * 10
+            )
+
+        return 500.0
+
+    # ==========================================================
+    # ASSIGN OCR ITEMS TO CELLS
+    # ==========================================================
 
     def _assign_items_to_cells(
         self,
         items: list[dict],
         grid: dict,
-    ):
+    ) -> dict:
 
-        anchor_by_cell = (
-            grid["anchor_by_cell"]
+        cells = {}
+
+        columns = grid["columns"]
+        rows = grid["rows"]
+
+        column_boundaries = grid.get(
+            "column_boundaries",
+            [],
         )
 
-        banner_limit = (
-            grid["banner_limit"]
+        row_boundaries = grid.get(
+            "row_boundaries",
+            [],
         )
 
-        anchor_ids = {
-            a["id"]
-            for a in anchor_by_cell.values()
-        }
+        if not columns or not rows:
+            return cells
 
-        cells = {
-            cell: {
-                "anchor": anchor,
-                "items": [],
-            }
-            for cell, anchor
-            in anchor_by_cell.items()
-        }
+        # ------------------------------------------------------
+        # FALLBACK:
+        #
+        # If boundaries are unavailable, use the old method.
+        # ------------------------------------------------------
 
-        page_text: list[dict] = []
+        use_boundaries = (
+            len(column_boundaries)
+            == len(columns)
+            and len(row_boundaries)
+            == len(rows)
+        )
 
         for item in items:
 
-            if item["id"] in anchor_ids:
-                continue
+            x = item["x"]
+            y = item["y"]
 
-            # Too wide for one card.
-            # Treat as header/footer/banner.
-            if (
-                banner_limit is not None
-                and item["w"] > banner_limit
-            ):
+            column_index = None
+            row_index = None
 
-                page_text.append(item)
+            # ==================================================
+            # NEW BOUNDARY-BASED ASSIGNMENT
+            # ==================================================
 
-                continue
+            if use_boundaries:
 
-            cell = self._locate_cell(
-                item,
-                grid,
-            )
+                for index, (
+                    left,
+                    right,
+                ) in enumerate(
+                    column_boundaries
+                ):
 
-            if cell is None:
+                    if (
+                        x >= left
+                        and x < right
+                    ):
 
-                page_text.append(item)
+                        column_index = index
+                        break
 
-                continue
+                for index, (
+                    top,
+                    bottom,
+                ) in enumerate(
+                    row_boundaries
+                ):
 
-            cells.setdefault(
-                cell,
-                {
-                    "anchor": None,
-                    "items": [],
-                },
-            )["items"].append(item)
+                    if (
+                        y >= top
+                        and y < bottom
+                    ):
 
-        # Cells without serial anchors are kept only when
-        # they contain enough lines to look like real cards.
-        for cell in list(cells.keys()):
+                        row_index = index
+                        break
 
-            data = cells[cell]
+                if (
+                    column_index is None
+                    or row_index is None
+                ):
 
-            if (
-                data["anchor"] is None
-                and len(
-                    data["items"]
-                )
-                < self.MIN_ORPHAN_LINES
-            ):
+                    continue
 
-                page_text.extend(
-                    data["items"]
-                )
-
-                del cells[cell]
-
-        return (
-            cells,
-            page_text,
-        )
-
-    # ------------------------------------------------------------------
-    # STEP 6 - card text blocks
-    # ------------------------------------------------------------------
-
-    def _reading_order(
-        self,
-        cell_items: list[dict],
-        all_items: list[dict],
-    ):
-
-        median_item_h = (
-            self._median(
-                i["h"]
-                for i in all_items
-            )
-            or 1.0
-        )
-
-        line_tolerance = (
-            self.LINE_TOLERANCE_FACTOR
-            * median_item_h
-        )
-
-        lines: list[dict] = []
-
-        for item in sorted(
-            cell_items,
-            key=lambda i: i["y"],
-        ):
-
-            if (
-                lines
-                and abs(
-                    item["y"]
-                    - lines[-1]["y"]
-                )
-                <= line_tolerance
-            ):
-
-                lines[-1]["items"].append(
-                    item
-                )
+            # ==================================================
+            # OLD FALLBACK
+            # ==================================================
 
             else:
 
-                lines.append(
-                    {
-                        "y": item["y"],
-                        "items": [item],
-                    }
+                column_index = min(
+                    range(
+                        len(columns)
+                    ),
+                    key=lambda index: abs(
+                        x - columns[index]
+                    ),
                 )
 
-        ordered: list[dict] = []
-
-        for line in lines:
-
-            ordered.extend(
-                sorted(
-                    line["items"],
-                    key=lambda i: i["x1"],
+                row_index = min(
+                    range(
+                        len(rows)
+                    ),
+                    key=lambda index: abs(
+                        y - rows[index]
+                    ),
                 )
+
+            cell_key = (
+                row_index,
+                column_index,
             )
 
-        return ordered
+            cells.setdefault(
+                cell_key,
+                [],
+            ).append(
+                item
+            )
+
+        return cells
+
+        # ==========================================================
+    # CLEAN VOTER RECORD OCR TEXT
+    # ==========================================================
+
+    def _clean_voter_record_text(
+        self,
+        text: str,
+    ) -> str:
+
+        if not text:
+            return text
+
+        lines = []
+
+        for line in text.splitlines():
+
+            cleaned = line.strip()
+
+            if not cleaned:
+                continue
+
+            # --------------------------------------------------
+            # Remove OCR artifacts that are not voter fields.
+            # --------------------------------------------------
+
+            if cleaned.lower() == "photo is":
+                continue
+
+            if cleaned.lower() == "available":
+                continue
+
+            # --------------------------------------------------
+            # Normalize common OCR variations of:
+            #
+            # வீட்டு எண்
+            #
+            # This is important because some OCR output was:
+            #
+            # வீட்டு எrஎன : 146
+            # வீட்டு எரென : 146
+            # --------------------------------------------------
+
+            cleaned = re.sub(
+                r"வீட்டு\s*எ[rR]\s*எ[னn]",
+                "வீட்டு எண்",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            cleaned = re.sub(
+                r"வீட்டு\s*எரென",
+                "வீட்டு எண்",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            # --------------------------------------------------
+            # Normalize spacing around the house-number colon.
+            # --------------------------------------------------
+
+            cleaned = re.sub(
+                r"(வீட்டு\s*எண்)\s*[:：]\s*",
+                r"\1 : ",
+                cleaned,
+            )
+
+            lines.append(cleaned)
+
+        return "\n".join(lines).strip()
+
+    # ==========================================================
+    # FORMAT VOTER CARDS
+    # =========================================================
 
     def _format_cards(
         self,
         cells: dict,
         grid: dict,
-        all_items: list[dict],
-    ) -> list[str]:
+    ) -> list[dict]:
 
-        records: list[str] = []
+        records = []
 
-        # Reading order:
-        # row by row, left to right.
-        for cell in sorted(
+        for cell_key in sorted(
             cells.keys()
         ):
 
-            data = cells[cell]
-
-            ordered_items = (
-                self._reading_order(
-                    data["items"],
-                    all_items,
-                )
+            row_index, column_index = (
+                cell_key
             )
 
-            lines = []
+            cell_items = cells[
+                cell_key
+            ]
 
-            if data["anchor"] is not None:
+            ordered_items = self._reading_order(
+                cell_items,
+                cell_items,
+            )
 
-                lines.append(
-                    data["anchor"]["text"]
-                )
+            if not ordered_items:
+                continue
 
-            lines.extend(
+            serial = None
+            serial_item = None
+
+            for item in ordered_items:
+
+                if "serial" in item:
+
+                    serial = item[
+                        "serial"
+                    ]
+
+                    serial_item = item
+
+                    break
+
+            # --------------------------------------------------
+            # A cell without a serial anchor is not a voter.
+            # --------------------------------------------------
+
+            if serial is None:
+                continue
+
+            lines = [
                 item["text"]
                 for item in ordered_items
-            )
+                if item["text"].strip()
+            ]
 
-            record = "\n".join(
+            if not lines:
+                continue
+
+            text = "\n".join(
                 lines
             ).strip()
 
-            if record:
-                records.append(record)
+            # --------------------------------------------------
+            # Clean only known OCR artifacts.
+            #
+            # This does NOT change grouping or OCR detection.
+            # --------------------------------------------------
+
+            text = self._clean_voter_record_text(
+                text
+            )
+
+            record = {
+                "serial_number": serial,
+                "text": text,
+                "page_number": None,
+            }
+
+            # --------------------------------------------------
+            # EPIC EXTRACTION
+            # --------------------------------------------------
+
+            epic_numbers = []
+
+            for item in ordered_items:
+
+                item_text = item.get(
+                    "text",
+                    "",
+                )
+
+                if not item_text:
+                    continue
+
+                matches = (
+                    self.EPIC_PATTERN.findall(
+                        item_text
+                    )
+                )
+
+                for match in matches:
+
+                    epic = match.upper()
+
+                    if epic not in epic_numbers:
+
+                        epic_numbers.append(
+                            epic
+                        )
+
+            if epic_numbers:
+
+                record[
+                    "epic_numbers"
+                ] = epic_numbers
+
+            records.append(
+                record
+            )
 
             self._log_card(
-                cell,
-                data,
-                ordered_items,
-                grid,
+                record
             )
+
+            # --------------------------------------------------
+            # TEMPORARY EPIC COORDINATE DEBUG
+            #
+            # This does NOT change grouping.
+            #
+            # It only tells us exactly where the serial and
+            # EPIC OCR boxes are located inside the assigned
+            # voter cell.
+            #
+            # We especially need cards that currently contain
+            # two EPICs.
+            # --------------------------------------------------
+
+            if len(epic_numbers) >= 2:
+
+                self._log()
+
+                self._log(
+                    "---------- EPIC COORDINATE DEBUG ----------"
+                )
+
+                self._log(
+                    f"CELL row={row_index} "
+                    f"column={column_index} "
+                    f"SERIAL={serial}"
+                )
+
+                if serial_item is not None:
+
+                    self._log(
+                        f"SERIAL BOX: "
+                        f"text={serial_item['text']!r} "
+                        f"x1={serial_item['x1']:.1f} "
+                        f"x2={serial_item['x2']:.1f} "
+                        f"y1={serial_item['y1']:.1f} "
+                        f"y2={serial_item['y2']:.1f} "
+                        f"center=({serial_item['x']:.1f},"
+                        f"{serial_item['y']:.1f})"
+                    )
+
+                self._log(
+                    "CELL BOUNDARY: "
+                    f"x={grid['column_boundaries'][column_index][0]:.1f}"
+                    f" -> "
+                    f"{grid['column_boundaries'][column_index][1]:.1f} "
+                    f"y={grid['row_boundaries'][row_index][0]:.1f}"
+                    f" -> "
+                    f"{grid['row_boundaries'][row_index][1]:.1f}"
+                )
+
+                for item in ordered_items:
+
+                    item_text = item.get(
+                        "text",
+                        "",
+                    )
+
+                    if not item_text:
+                        continue
+
+                    item_epics = (
+                        self.EPIC_PATTERN.findall(
+                            item_text
+                        )
+                    )
+
+                    if not item_epics:
+                        continue
+
+                    self._log(
+                        f"EPIC BOX: "
+                        f"text={item_text!r} "
+                        f"x1={item['x1']:.1f} "
+                        f"x2={item['x2']:.1f} "
+                        f"y1={item['y1']:.1f} "
+                        f"y2={item['y2']:.1f} "
+                        f"center=({item['x']:.1f},"
+                        f"{item['y']:.1f})"
+                    )
+
+                self._log(
+                    "--------------------------------------------"
+                )
 
         return records
 
-    # ------------------------------------------------------------------
-    # Debug output
-    # ------------------------------------------------------------------
+    # ==========================================================
+    # READING ORDER
+    # ==========================================================
+
+    def _reading_order(
+        self,
+        items: list[dict],
+        reference_items: list[dict],
+    ) -> list[dict]:
+
+        if not items:
+            return []
+
+        heights = [
+            item["h"]
+            for item in reference_items
+            if item.get("h", 0) > 0
+        ]
+
+        if heights:
+
+            median_height = statistics.median(
+                heights
+            )
+
+        else:
+
+            median_height = 10.0
+
+        line_tolerance = (
+            median_height
+            * self.LINE_TOLERANCE_FACTOR
+        )
+
+        sorted_items = sorted(
+            items,
+            key=lambda item: (
+                item["y"],
+                item["x"],
+            ),
+        )
+
+        lines = []
+
+        for item in sorted_items:
+
+            assigned = False
+
+            for line in lines:
+
+                line_y = statistics.mean(
+                    value["y"]
+                    for value in line
+                )
+
+                if abs(
+                    item["y"]
+                    - line_y
+                ) <= line_tolerance:
+
+                    line.append(
+                        item
+                    )
+
+                    assigned = True
+
+                    break
+
+            if not assigned:
+
+                lines.append(
+                    [item]
+                )
+
+        ordered = []
+
+        for line in sorted(
+            lines,
+            key=lambda line: statistics.mean(
+                value["y"]
+                for value in line
+            ),
+        ):
+
+            ordered.extend(
+                sorted(
+                    line,
+                    key=lambda item: item["x"],
+                )
+            )
+
+        return ordered
+
+    # ==========================================================
+    # DEBUG GRID
+    # ==========================================================
 
     def _log_grid(
         self,
         grid: dict,
-        anchors_found: int,
-        anchors_used: int,
-        edge_count: int,
-    ) -> None:
-
-        if not self.debug_grouping:
-            return
-
-        columns = grid["columns"]
-        rows = grid["rows"]
-
-        self._log(
-            f"Serial boxes found: "
-            f"{anchors_found}   "
-            f"used as grid anchors: "
-            f"{anchors_used}"
-        )
-
-        self._log(
-            "Columns (serial x): "
-            + ", ".join(
-                f"{c['x']:.1f}"
-                for c in columns
-            )
-        )
-
-        if grid["pitch_x"]:
-
-            self._log(
-                f"Column pitch: "
-                f"{grid['pitch_x']:.1f}px"
-            )
-
-        self._log(
-            "Rows (serial y):    "
-            + ", ".join(
-                f"{r['y']:.1f}"
-                for r in rows
-            )
-        )
-
-        self._log(
-            f"Row pitch:    "
-            f"{grid['pitch_y']:.1f}px"
-        )
-
-        self._log(
-            f"Card left edge is "
-            f"{-grid['left_offset']:.1f}px "
-            f"LEFT of the serial number "
-            f"({edge_count} text lines agree)"
-        )
-
-        self._log(
-            "Card left edges (x): "
-            + ", ".join(
-                f"{c['left']:.1f}"
-                for c in columns
-            )
-        )
+    ):
 
         self._log()
+
+        self._log(
+            "---------- GRID SUMMARY ----------"
+        )
+
+        self._log(
+            f"Columns: {len(grid['columns'])}"
+        )
+
+        self._log(
+            f"Rows: {len(grid['rows'])}"
+        )
+
+        self._log(
+            f"Row pitch: "
+            f"{grid['row_pitch']:.2f}"
+        )
+
+        self._log(
+            f"Card width: "
+            f"{grid['card_width']:.2f}"
+        )
+
+        self._log(
+            f"Card height: "
+            f"{grid['card_height']:.2f}"
+        )
+
+        self._log(
+            "Column boundaries:"
+        )
+
+        for index, boundary in enumerate(
+            grid.get(
+                "column_boundaries",
+                [],
+            )
+        ):
+
+            self._log(
+                f"  COLUMN {index}: "
+                f"{boundary[0]:.1f} -> "
+                f"{boundary[1]:.1f}"
+            )
+
+        self._log(
+            "----------------------------------"
+        )
+
+    # ==========================================================
+    # DEBUG CARD
+    # ==========================================================
 
     def _log_card(
         self,
-        cell: tuple,
-        data: dict,
-        ordered_items: list[dict],
-        grid: dict,
-    ) -> None:
+        record: dict,
+    ):
 
         if not self.debug_grouping:
             return
 
-        row_index, column_index = cell
-
-        columns = grid["columns"]
-
-        row = grid["rows"][row_index]
-
-        column = columns[column_index]
-
-        if column_index + 1 < len(columns):
-
-            x_end = columns[
-                column_index + 1
-            ]["left"]
-
-        else:
-
-            x_end = grid["right_limit"]
-
-        anchor = data["anchor"]
-
-        if anchor is not None:
-
-            title = (
-                f"SERIAL "
-                f"{anchor['serial']}"
-            )
-
-        else:
-
-            title = (
-                "NO SERIAL "
-                "(serial box not detected)"
-            )
-
-        self._log(
-            f"{title}   "
-            f"(row {row_index + 1}, "
-            f"column {column_index + 1})"
+        serial = record.get(
+            "serial_number"
         )
 
-        if anchor is not None:
-
-            self._log(
-                f"  serial box: "
-                f"x={anchor['x']:.1f} "
-                f"y={anchor['y']:.1f}"
-            )
-
-        self._log(
-            f"  card area : "
-            f"x=[{column['left']:.1f}, "
-            f"{x_end:.1f})  "
-            f"y=[{row['top']:.1f}, "
-            f"{row['bottom']:.1f})"
+        epic = record.get(
+            "epic_numbers",
+            [],
         )
 
-        epics = [
-            item
-            for item in ordered_items
-            if self.EPIC_PATTERN.search(
-                item["text"]
-            )
-        ]
+        self._log(
+            f"CARD "
+            f"SERIAL={serial} "
+            f"EPIC={epic}"
+        )
 
-        if epics:
-
-            for item in epics:
-
-                self._log(
-                    f"  EPIC: "
-                    f"{item['text']}  "
-                    f"(x={item['x']:.1f}, "
-                    f"y={item['y']:.1f})"
-                )
-
-        else:
-
-            self._log(
-                "  EPIC: "
-                "(none found inside this card)"
-            )
-
-        for item in ordered_items:
-
-            self._log(
-                f"    | {item['text']}"
-            )
-
-        self._log()
+    # ==========================================================
+    # DEBUG SUMMARY
+    # ==========================================================
 
     def _log_summary(
         self,
-        cells: dict,
-        page_text: list[dict],
-    ) -> None:
-
-        if not self.debug_grouping:
-            return
-
-        self._log("-" * 72)
-
-        self._log(
-            f"Voter cards on this page: "
-            f"{len(cells)}"
-        )
-
-        # Serial sequence check.
-        previous = None
-
-        for cell in sorted(
-            cells.keys()
-        ):
-
-            anchor = (
-                cells[cell]["anchor"]
-            )
-
-            if anchor is None:
-                continue
-
-            serial = anchor["serial"]
-
-            if (
-                previous is not None
-                and serial != previous + 1
-            ):
-
-                self._log(
-                    f"WARNING: serial sequence "
-                    f"jumps {previous} -> {serial}"
-                )
-
-            previous = serial
-
-        # Compact SERIAL -> EPIC table.
-        self._log(
-            "SERIAL -> EPIC table:"
-        )
-
-        for cell in sorted(
-            cells.keys()
-        ):
-
-            data = cells[cell]
-
-            serial = (
-                data["anchor"]["serial"]
-                if data["anchor"] is not None
-                else "?"
-            )
-
-            found = [
-                match.group(0).upper()
-                for item in data["items"]
-                for match in [
-                    self.EPIC_PATTERN.search(
-                        item["text"]
-                    )
-                ]
-                if match
-            ]
-
-            self._log(
-                f"  {serial} -> "
-                f"{', '.join(found) if found else '-'}"
-            )
-
-        # Page-level text.
-        if page_text:
-
-            self._log(
-                f"Page text kept OUT of "
-                f"voter cards: "
-                f"{len(page_text)} boxes"
-            )
-
-            for item in sorted(
-                page_text,
-                key=lambda i: (
-                    i["y"],
-                    i["x1"],
-                ),
-            ):
-
-                self._log(
-                    f"    x={item['x']:.0f} "
-                    f"y={item['y']:.0f} "
-                    f"| {item['text']}"
-                )
-
-        self._log("=" * 72)
+        records: list[dict],
+    ):
 
         self._log()
 
+        self._log(
+            "---------- OCR SUMMARY ----------"
+        )
 
-# ----------------------------------------------------------------------
-# Global instance
-# ----------------------------------------------------------------------
+        self._log(
+            f"Records detected: "
+            f"{len(records)}"
+        )
+
+        if records:
+
+            serials = [
+                record.get(
+                    "serial_number"
+                )
+                for record in records
+                if record.get(
+                    "serial_number"
+                ) is not None
+            ]
+
+            if serials:
+
+                self._log(
+                    f"Serial range: "
+                    f"{min(serials)} - "
+                    f"{max(serials)}"
+                )
+
+        self._log(
+            "---------------------------------"
+        )
+
+    # ==========================================================
+    # LOGGING
+    # ==========================================================
+
+    def _log(
+        self,
+        message: str = "",
+    ):
+
+        if self.debug_grouping:
+
+            print(
+                message,
+                flush=True,
+            )
+
 
 ocr_service = OCRService()

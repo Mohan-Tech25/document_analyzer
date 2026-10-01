@@ -1,20 +1,24 @@
 from psycopg import Connection
 
 from app.core.exceptions import ChatException
-
-from app.repositories.chunk_repository import (
-    ChunkRepository,
-)
-
-from app.services.embedding_service import (
-    EmbeddingService,
-)
+from app.repositories.chunk_repository import ChunkRepository
+from app.services.embedding_service import EmbeddingService
 
 
 class RetrievalService:
     """
-    Service responsible for retrieving
-    relevant document chunks.
+    Service responsible for retrieving relevant document chunks.
+
+    Retrieval strategy:
+
+    1. Generate an embedding for the user question.
+    2. Search document chunks using pgvector.
+    3. Return the closest chunks.
+    4. Do not discard all results merely because the similarity
+       threshold is weak.
+
+    Document-level/header retrieval is handled separately by
+    ChatService using the actual document chunk order.
     """
 
     RELEVANCE_THRESHOLD = 0.60
@@ -39,8 +43,7 @@ class RetrievalService:
         """
         Get all chunks belonging to a document.
 
-        Used for broad document-level questions
-        and fallback retrieval.
+        Chunks are returned in document chunk order.
         """
 
         rows = self.chunk_repository.get_by_document(
@@ -48,19 +51,50 @@ class RetrievalService:
             document_id=document_id,
         )
 
-        return [
-            {
-                "id": row[0],
-                "chunk_index": row[1],
-                "content": row[2],
-                "page_number": row[3],
-                "created_at": row[4],
-            }
-            for row in rows
-        ]
+        if not rows:
+            return []
+
+        results = []
+
+        for row in rows:
+
+            if not row:
+                continue
+
+            if len(row) < 4:
+                continue
+
+            content = row[2]
+
+            if not content:
+                continue
+
+            results.append(
+                {
+                    "id": row[0],
+                    "chunk_index": row[1],
+                    "content": content,
+                    "page_number": row[3],
+                    "created_at": (
+                        row[4]
+                        if len(row) > 4
+                        else None
+                    ),
+                }
+            )
+
+        results.sort(
+            key=lambda chunk: (
+                int(chunk["chunk_index"])
+                if chunk.get("chunk_index") is not None
+                else 999999999
+            )
+        )
+
+        return results
 
     # =========================================================
-    # RETRIEVE RELEVANT CHUNKS
+    # SEMANTIC RETRIEVAL
     # =========================================================
 
     def retrieve_relevant_chunks(
@@ -72,17 +106,24 @@ class RetrievalService:
         document_type: str | None = None,
     ) -> list[dict]:
         """
-        Retrieve semantically relevant chunks
+        Retrieve semantically relevant document chunks
         using pgvector similarity search.
 
         Lower cosine distance means higher similarity.
 
-        For voter_list documents:
+        Important:
 
-            1 voter = 1 chunk
+        The relevance threshold is treated as a preference,
+        not a hard failure.
 
-        Therefore the complete matching chunk is
-        returned without modifying or splitting it.
+        This is important because:
+
+        English question
+                +
+        Tamil document
+
+        can produce a weaker embedding similarity even when
+        the requested information actually exists in the document.
         """
 
         if not question or not question.strip():
@@ -91,20 +132,23 @@ class RetrievalService:
                 "Question cannot be empty."
             )
 
-        # -----------------------------------------------------
-        # Create embedding for user question
-        # -----------------------------------------------------
+        # =====================================================
+        # CREATE QUESTION EMBEDDING
+        # =====================================================
 
         query_embedding = (
             self.embedding_service
             .create_embedding(
-                question
+                question.strip()
             )
         )
 
-        # -----------------------------------------------------
-        # Search pgvector
-        # -----------------------------------------------------
+        if not query_embedding:
+            return []
+
+        # =====================================================
+        # VECTOR SEARCH
+        # =====================================================
 
         rows = (
             self.chunk_repository
@@ -119,68 +163,124 @@ class RetrievalService:
         if not rows:
             return []
 
-        # -----------------------------------------------------
-        # Best similarity check
-        # -----------------------------------------------------
-
-        best_distance = rows[0][5]
-
-        if best_distance >= self.RELEVANCE_THRESHOLD:
-            return []
-
-        # -----------------------------------------------------
-        # Build results
-        # -----------------------------------------------------
+        # =====================================================
+        # BUILD RESULTS
+        # =====================================================
 
         results = []
 
         for row in rows:
+
+            if not row:
+                continue
+
+            if len(row) < 6:
+                continue
 
             content = row[2]
 
             if not content:
                 continue
 
+            distance = row[5]
+
+            result = {
+                "id": row[0],
+                "chunk_index": row[1],
+
+                # Keep complete source chunk.
+                "content": content,
+
+                "page_number": row[3],
+                "created_at": row[4],
+                "distance": distance,
+            }
+
             results.append(
-                {
-                    "id": row[0],
-                    "chunk_index": row[1],
-
-                    # IMPORTANT:
-                    # Keep the complete voter record.
-                    "content": content,
-
-                    "page_number": row[3],
-                    "created_at": row[4],
-                    "distance": row[5],
-                }
+                result
             )
 
+        if not results:
+            return []
+
+        # =====================================================
+        # RELEVANCE PREFERENCE
+        # =====================================================
+        #
+        # Do NOT return [] simply because the best distance is
+        # above the threshold.
+        #
+        # The caller can combine these results with:
+        #
+        # - document header
+        # - direct chunk retrieval
+        # - other evidence
+        #
+        # This is especially important for multilingual documents.
+        # =====================================================
+
+        relevant_results = [
+            result
+            for result in results
+            if (
+                result.get("distance") is not None
+                and result["distance"]
+                < self.RELEVANCE_THRESHOLD
+            )
+        ]
+
+        if relevant_results:
+            return relevant_results
+
         # -----------------------------------------------------
-        # Voter-list handling
-        # -----------------------------------------------------
-
-        if document_type == "voter_list":
-
-            # Each result already represents one voter.
-            #
-            # Do NOT merge multiple chunks.
-            # Do NOT split the content.
-            #
-            # Example:
-            #
-            # Chunk 15 → Person 15
-            # Chunk 16 → Person 16
-            # Chunk 17 → Person 17
-
-            return results
-
-        # -----------------------------------------------------
-        # Normal documents
+        # No result passed threshold.
+        #
+        # Return the best available semantic result instead
+        # of throwing away potentially useful evidence.
         # -----------------------------------------------------
 
         return results
 
+    # =========================================================
+    # OPTIONAL: GET FIRST DOCUMENT CHUNKS
+    # =========================================================
+
+    def get_first_document_chunks(
+        self,
+        connection: Connection,
+        document_id: int,
+        limit: int = 3,
+    ) -> list[dict]:
+        """
+        Get the first N chunks of a document.
+
+        Useful for document-level information such as:
+
+        - title
+        - heading
+        - date
+        - organization
+        - location
+        - constituency
+        - document type
+
+        This retrieval is positional, not semantic.
+        """
+
+        if limit <= 0:
+            return []
+
+        chunks = self.get_document_chunks(
+            connection=connection,
+            document_id=document_id,
+        )
+
+        return chunks[:limit]
+
+
+# =============================================================
+# SERVICE INITIALIZATION
+# =============================================================
 
 retrieval_service = RetrievalService(
     chunk_repository=ChunkRepository(),

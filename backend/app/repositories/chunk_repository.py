@@ -84,6 +84,49 @@ class ChunkRepository:
             return cursor.fetchall()
 
     # ============================================================
+    # GET FIRST CHUNKS
+    # ============================================================
+
+    def get_first_chunks(
+        self,
+        connection: Connection,
+        document_id: int,
+        limit: int = 6,
+    ) -> list[tuple]:
+        """
+        Return the first chunks of a document.
+
+        These chunks are important because document titles,
+        headings, metadata and identifying information commonly
+        appear at the beginning of a document.
+
+        This method does NOT use vector similarity.
+        """
+
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    chunk_index,
+                    content,
+                    page_number,
+                    created_at
+                FROM document_chunks
+                WHERE document_id = %s
+                ORDER BY chunk_index
+                LIMIT %s;
+                """,
+                (
+                    document_id,
+                    limit,
+                ),
+            )
+
+            return cursor.fetchall()
+
+    # ============================================================
     # UPDATE EMBEDDING
     # ============================================================
 

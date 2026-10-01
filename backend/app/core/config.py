@@ -1,3 +1,4 @@
+
 import os
 
 from dotenv import load_dotenv
@@ -76,9 +77,9 @@ class Settings:
     )
 
     MINERU_ENABLED = os.getenv(
-    "MINERU_ENABLED",
-    "true"
-).lower() == "true"
+        "MINERU_ENABLED",
+        "true"
+    ).lower() == "true"
 
     MINERU_COMMAND = os.getenv(
         "MINERU_COMMAND",
@@ -92,7 +93,7 @@ class Settings:
 
     MINERU_REMOTE = os.getenv(
         "MINERU_REMOTE",
-        "true"
+        "false"
     ).lower() == "true"
 
     MINERU_TIMEOUT = int(

@@ -1,52 +1,168 @@
-
-import os
+import math
 
 from psycopg import Connection
 
 from app.core.exceptions import ChatException
-from app.repositories.analysis_repository import AnalysisRepository
+
 from app.repositories.chunk_repository import ChunkRepository
+from app.repositories.analysis_repository import AnalysisRepository
 from app.repositories.document_repository import DocumentRepository
+
+from app.services.retrieval_service import RetrievalService
 from app.services.embedding_service import EmbeddingService
 from app.services.ollama_service import OllamaService
-from app.services.retrieval_service import RetrievalService
-from app.services.voter_query_service import VoterQueryService
 from app.services.voter_record_service import VoterRecordService
+from app.services.voter_query_service import VoterQueryService
+
+
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+UNAVAILABLE_MESSAGE = (
+    "The requested information is not available in the provided content."
+)
+
+MAX_DOCUMENT_CONTEXT_CHARS = 10000
+
+MAX_DOCUMENT_ANSWER_CONTEXT_CHARS = 7000
+
+MAX_LABEL_VALUE_EVIDENCE_CHARS = 3500
+
+MAX_SEMANTIC_FALLBACK_CHARS = 6000
+
+MAX_VOTER_RECORD_CONTEXT_CHARS = 20000
+
+SEMANTIC_TOP_K = 5
+
+HEADER_CHUNKS = 3
+
+MAX_DOCUMENT_FIELD_CANDIDATES = 30
+
+MAX_DOCUMENT_FIELD_EMBEDDING_CHARS = 300
+
+DOCUMENT_FIELD_SIMILARITY_THRESHOLD = 0.25
 
 
 class ChatService:
 
     def __init__(
         self,
+        document_repository: DocumentRepository,
         chunk_repository: ChunkRepository,
         analysis_repository: AnalysisRepository,
-        document_repository: DocumentRepository,
         retrieval_service: RetrievalService,
+        embedding_service: EmbeddingService,
         ollama_service: OllamaService,
         voter_record_service: VoterRecordService,
         voter_query_service: VoterQueryService,
     ):
+        self.document_repository = document_repository
         self.chunk_repository = chunk_repository
         self.analysis_repository = analysis_repository
-        self.document_repository = document_repository
         self.retrieval_service = retrieval_service
+        self.embedding_service = embedding_service
         self.ollama_service = ollama_service
         self.voter_record_service = voter_record_service
         self.voter_query_service = voter_query_service
 
-    # =========================================================
-    # IMAGE CHECK
-    # =========================================================
+    # ============================================================
+    # DOCUMENT ROW -> DICT
+    # ============================================================
 
+    @staticmethod
+    def _document_row_to_dict(row) -> dict:
+
+        if row is None:
+            return {}
+
+        if isinstance(row, dict):
+            return row
+
+        document = {}
+
+        document["id"] = (
+            row[0]
+            if len(row) > 0
+            else None
+        )
+
+        document["file_name"] = (
+            row[1]
+            if len(row) > 1
+            else None
+        )
+
+        document["file_type"] = (
+            row[2]
+            if len(row) > 2
+            else None
+        )
+
+        document["document_type"] = (
+            row[3]
+            if len(row) > 3
+            else None
+        )
+
+        document["file_path"] = (
+            row[4]
+            if len(row) > 4
+            else None
+        )
+
+        return document
+
+    # ============================================================
+    # BASIC HELPERS
+    # ============================================================
+
+    @staticmethod
     def _is_image(
-        self,
-        filename: str,
+        document: dict,
     ) -> bool:
 
-        if not filename:
-            return False
+        document_type = str(
+            document.get(
+                "document_type",
+                "",
+            )
+        ).lower()
 
-        image_extensions = {
+        mime_type = str(
+            document.get(
+                "mime_type",
+                "",
+            )
+        ).lower()
+
+        file_name = str(
+            document.get(
+                "file_name",
+                "",
+            )
+        ).lower()
+
+        image_types = {
+            "image",
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+            "bmp",
+            "tiff",
+            "tif",
+        }
+
+        image_mimes = {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+            "image/bmp",
+            "image/tiff",
+        }
+
+        image_extensions = (
             ".jpg",
             ".jpeg",
             ".png",
@@ -54,17 +170,77 @@ class ChatService:
             ".bmp",
             ".tiff",
             ".tif",
-        }
+        )
 
-        extension = os.path.splitext(
-            filename
-        )[1].lower()
+        return (
+            document_type in image_types
+            or mime_type in image_mimes
+            or file_name.endswith(
+                image_extensions
+            )
+        )
 
-        return extension in image_extensions
+    @staticmethod
+    def _sort_document_chunks(
+        chunks: list[dict],
+    ) -> list[dict]:
 
-    # =========================================================
-    # GET VOTER RECORDS
-    # =========================================================
+        return sorted(
+            chunks,
+            key=lambda chunk: (
+                int(
+                    chunk.get(
+                        "chunk_index"
+                    )
+                )
+                if chunk.get(
+                    "chunk_index"
+                ) is not None
+                else 999999999
+            ),
+        )
+
+    @staticmethod
+    def _convert_chunk_rows(
+        rows: list,
+    ) -> list[dict]:
+
+        if not rows:
+            return []
+
+        chunks = []
+
+        for row in rows:
+
+            if not row or len(row) < 4:
+                continue
+
+            content = row[2]
+
+            if not content:
+                continue
+
+            chunks.append(
+                {
+                    "id": row[0],
+                    "chunk_index": row[1],
+                    "content": content,
+                    "page_number": row[3],
+                    "created_at": (
+                        row[4]
+                        if len(row) > 4
+                        else None
+                    ),
+                }
+            )
+
+        return ChatService._sort_document_chunks(
+            chunks
+        )
+
+    # ============================================================
+    # VOTER HELPERS
+    # ============================================================
 
     def _get_voter_records(
         self,
@@ -72,105 +248,49 @@ class ChatService:
         document_id: int,
     ) -> list[dict]:
 
-        rows = self.chunk_repository.get_by_document(
-            connection,
-            document_id,
+        rows = (
+            self.chunk_repository.get_by_document(
+                connection=connection,
+                document_id=document_id,
+            )
         )
 
         if not rows:
             return []
 
-        records = self.voter_record_service.parse_chunk_rows(
+        return self.voter_record_service.parse_chunk_rows(
             rows
         )
 
-        # Preserve document/chunk order.
-        # Important for position lookups.
-        for position, record in enumerate(
-            records,
-            start=1,
-        ):
-            record["_record_position"] = position
-
-        return records
-
-    # =========================================================
-    # EPIC / VOTER ID FORMATTER
-    # =========================================================
-
+    @staticmethod
     def _format_epic_numbers(
-        self,
-        record,
+        record: dict,
     ) -> str:
 
-        if not record:
-            return "Not available"
-
-        epic_numbers = None
-
-        if isinstance(
-            record,
-            dict,
-        ):
-
-            epic_numbers = record.get(
-                "epic_numbers"
-            )
-
-            if epic_numbers is None:
-                epic_numbers = record.get(
-                    "epic"
-                )
-
-            if epic_numbers is None:
-                epic_numbers = record.get(
-                    "voter_id"
-                )
-
-        else:
-
-            epic_numbers = getattr(
-                record,
-                "epic_numbers",
-                None,
-            )
-
-            if epic_numbers is None:
-                epic_numbers = getattr(
-                    record,
-                    "epic",
-                    None,
-                )
-
-            if epic_numbers is None:
-                epic_numbers = getattr(
-                    record,
-                    "voter_id",
-                    None,
-                )
+        epic_numbers = record.get(
+            "epic_numbers"
+        )
 
         if not epic_numbers:
-            return "Not available"
+            return UNAVAILABLE_MESSAGE
 
         if isinstance(
             epic_numbers,
-            (list, tuple),
+            list,
         ):
 
-            values = [
+            valid_values = [
                 str(value).strip()
                 for value in epic_numbers
-                if (
-                    value is not None
-                    and str(value).strip()
-                )
+                if value is not None
+                and str(value).strip()
             ]
 
-            if not values:
-                return "Not available"
+            if not valid_values:
+                return UNAVAILABLE_MESSAGE
 
             return ", ".join(
-                values
+                valid_values
             )
 
         value = str(
@@ -178,1349 +298,1906 @@ class ChatService:
         ).strip()
 
         if not value:
-            return "Not available"
+            return UNAVAILABLE_MESSAGE
 
         return value
 
-    # =========================================================
-    # GET VOTER FIELD VALUE
-    # =========================================================
-
+    @staticmethod
     def _get_voter_field_value(
-        self,
-        record,
+        record: dict,
         field_name: str,
     ) -> str:
 
-        if not record:
-            return "Not available"
-
         field_name = (
-            str(field_name)
+            field_name
             .lower()
             .strip()
         )
 
-        aliases = {
-
-            "name": [
-                "name",
-                "voter_name",
-                "english_name",
-                "tamil_name",
-            ],
-
-            "age": [
-                "age",
-            ],
-
-            "gender": [
-                "gender",
-                "sex",
-            ],
-
-            "epic": [
-                "epic_numbers",
-                "epic",
-                "voter_id",
-            ],
-
-            "epic_numbers": [
-                "epic_numbers",
-                "epic",
-                "voter_id",
-            ],
-
-            "voter_id": [
-                "epic_numbers",
-                "epic",
-                "voter_id",
-            ],
-
-            "serial": [
-                "serial_number",
-                "serial",
-            ],
-
-            "serial_number": [
-                "serial_number",
-                "serial",
-            ],
-
-            "position": [
-                "_record_position",
-                "position",
-            ],
-
-            "house": [
-                "house_number",
-                "house",
-            ],
-
-            "house_number": [
-                "house_number",
-                "house",
-            ],
-
-            "relation_type": [
-                "relation_type",
-            ],
-
-            "relation_name": [
-                "relation_name",
-            ],
-        }
-
-        # -----------------------------------------------------
+        # --------------------------------------------------------
         # EPIC / VOTER ID
-        # -----------------------------------------------------
+        # --------------------------------------------------------
 
         if field_name in {
             "epic",
+            "epic_number",
             "epic_numbers",
             "voter_id",
+            "voterid",
+            "voter_id_number",
         }:
 
-            return self._format_epic_numbers(
+            return ChatService._format_epic_numbers(
                 record
             )
 
-        # -----------------------------------------------------
-        # OTHER FIELDS
-        # -----------------------------------------------------
+        # --------------------------------------------------------
+        # NORMAL FIELD
+        # --------------------------------------------------------
 
-        possible_keys = aliases.get(
-            field_name,
-            [field_name],
+        value = record.get(
+            field_name
         )
 
-        for key in possible_keys:
-
-            if isinstance(
-                record,
-                dict,
-            ):
-
-                value = record.get(
-                    key
-                )
-
-            else:
-
-                value = getattr(
-                    record,
-                    key,
-                    None,
-                )
-
-            if (
-                value is not None
-                and str(value).strip()
-            ):
-
-                return str(
-                    value
-                ).strip()
-
-        return "Not available"
-
-    # =========================================================
-    # NORMALIZE REQUESTED FIELDS
-    # =========================================================
-
-    def _normalize_requested_fields(
-        self,
-        requested_fields,
-    ) -> list[str]:
-
-        if not requested_fields:
-            return ["name"]
+        if value is None:
+            return UNAVAILABLE_MESSAGE
 
         if isinstance(
-            requested_fields,
-            str,
+            value,
+            list,
         ):
 
-            requested_fields = [
-                requested_fields
+            values = [
+                str(item).strip()
+                for item in value
+                if item is not None
+                and str(item).strip()
             ]
 
-        normalized_fields = []
+            if not values:
+                return UNAVAILABLE_MESSAGE
 
-        for field in requested_fields:
+            return ", ".join(
+                values
+            )
+
+        value = str(
+            value
+        ).strip()
+
+        if not value:
+            return UNAVAILABLE_MESSAGE
+
+        return value
+
+    @staticmethod
+    def _normalize_requested_fields(
+        fields,
+    ) -> list[str]:
+
+        if not fields:
+            return ["all"]
+
+        if isinstance(
+            fields,
+            str,
+        ):
+            fields = [fields]
+
+        normalized = []
+
+        for field in fields:
 
             if field is None:
                 continue
 
-            field = (
+            value = (
                 str(field)
-                .lower()
                 .strip()
+                .lower()
+            )
+
+            if not value:
+                continue
+
+            if value not in normalized:
+                normalized.append(
+                    value
+                )
+
+        return (
+            normalized
+            if normalized
+            else ["all"]
+        )
+
+    def _build_complete_voter_context(
+        self,
+        records: list[dict],
+    ) -> str:
+
+        if not records:
+            return ""
+
+        sections = []
+
+        current_length = 0
+
+        for record in records:
+
+            lines = []
+
+            for key, value in record.items():
+
+                # ------------------------------------------------
+                # Do not expose internal OCR aliases as separate
+                # voter IDs.
+                # ------------------------------------------------
+
+                if key in {
+                    "epic_numbers",
+                    "epic",
+                    "voter_id",
+                }:
+
+                    value = (
+                        self._format_epic_numbers(
+                            record
+                        )
+                    )
+
+                if value is None:
+                    continue
+
+                if isinstance(
+                    value,
+                    list,
+                ):
+
+                    values = [
+                        str(item).strip()
+                        for item in value
+                        if item is not None
+                        and str(item).strip()
+                    ]
+
+                    if not values:
+                        continue
+
+                    value = ", ".join(
+                        values
+                    )
+
+                value = str(
+                    value
+                ).strip()
+
+                if not value:
+                    continue
+
+                lines.append(
+                    f"{key}: {value}"
+                )
+
+            if not lines:
+                continue
+
+            section = "\n".join(
+                lines
+            )
+
+            section_length = (
+                len(section) + 2
             )
 
             if (
-                field
-                and field not in normalized_fields
+                current_length
+                + section_length
+                > MAX_VOTER_RECORD_CONTEXT_CHARS
             ):
+                break
 
-                normalized_fields.append(
-                    field
-                )
+            sections.append(
+                section
+            )
 
-        if not normalized_fields:
-            return ["name"]
+            current_length += (
+                section_length
+            )
 
-        # -----------------------------------------------------
-        # ALL MEANS ALL ACTUAL VOTER FIELDS
-        # -----------------------------------------------------
+        return "\n\n".join(
+            sections
+        )
 
-        if "all" in normalized_fields:
+    # ============================================================
+    # STORED ANALYSIS
+    # ============================================================
 
-            return [
-                "serial_number",
-                "name",
-                "relation_type",
-                "relation_name",
-                "house_number",
-                "age",
-                "gender",
-                "voter_id",
-            ]
-
-        return normalized_fields
-
-    # =========================================================
-    # BUILD REQUESTED VOTER CONTEXT
-    # =========================================================
-
-    def _build_requested_voter_context(
+    def _get_stored_analysis(
         self,
-        matched_records,
-        requested_fields,
+        connection: Connection,
+        document_id: int,
     ) -> str:
 
-        if not matched_records:
-            return ""
-
-        requested_fields = (
-            self._normalize_requested_fields(
-                requested_fields
+        analysis = (
+            self.analysis_repository.get_by_document(
+                connection=connection,
+                document_id=document_id,
             )
         )
 
-        display_names = {
+        if not analysis:
+            return ""
 
-            "serial_number": "Serial Number",
-
-            "name": "Name",
-
-            "relation_type": "Relation Type",
-
-            "relation_name": "Relation Name",
-
-            "house_number": "House Number",
-
-            "age": "Age",
-
-            "gender": "Gender",
-
-            "voter_id": "Voter ID",
-
-            "epic": "Voter ID",
-
-            "epic_numbers": "Voter ID",
-
-            "position": "Position",
-        }
-
-        lines = []
-
-        for index, record in enumerate(
-            matched_records,
-            start=1,
+        if isinstance(
+            analysis,
+            dict,
         ):
 
-            record_lines = []
+            for key in (
+                "analysis",
+                "content",
+                "result",
+                "summary",
+                "text",
+            ):
 
-            for field in requested_fields:
+                value = analysis.get(
+                    key
+                )
 
-                value = (
-                    self._get_voter_field_value(
-                        record,
-                        field,
+                if value:
+                    return str(
+                        value
                     )
-                )
 
-                display_field = (
-                    display_names.get(
-                        field,
-                        field.replace(
-                            "_",
-                            " ",
-                        ).title(),
-                    )
-                )
+            return str(
+                analysis
+            )
 
-                record_lines.append(
-                    f"{display_field}: {value}"
-                )
+        if isinstance(
+            analysis,
+            (list, tuple),
+        ):
 
-            if record_lines:
+            values = [
+                str(value)
+                for value in analysis
+                if value
+            ]
 
-                lines.append(
-                    f"Record {index}:\n"
-                    + "\n".join(
-                        record_lines
-                    )
-                )
+            return "\n".join(
+                values
+            )
 
-        return "\n\n".join(
-            lines
+        return str(
+            analysis
         )
 
-    # =========================================================
-    # GET DOCUMENT LEVEL CONTEXT
-    # =========================================================
+    # ============================================================
+    # DOCUMENT FIELD PARSING
+    # ============================================================
+
+    @staticmethod
+    def _split_document_label_value(
+        line: str,
+    ) -> tuple[str, str] | None:
+
+        if not line:
+            return None
+
+        normalized_line = (
+            " ".join(
+                str(line)
+                .strip()
+                .split()
+            )
+        )
+
+        if not normalized_line:
+            return None
+
+        separators = (
+            "：",
+            ":",
+            "=",
+            " - ",
+            " – ",
+            " — ",
+        )
+
+        separator_used = None
+
+        for separator in separators:
+
+            if separator in normalized_line:
+
+                separator_used = (
+                    separator
+                )
+
+                break
+
+        if separator_used is None:
+            return None
+
+        label, value = (
+            normalized_line.split(
+                separator_used,
+                1,
+            )
+        )
+
+        label = label.strip()
+        value = value.strip()
+
+        if not label or not value:
+            return None
+
+        if len(label) > 150:
+            return None
+
+        if len(value) > 500:
+            return None
+
+        if len(label.split()) > 25:
+            return None
+
+        return (
+            label,
+            value,
+        )
+
+    def _extract_document_fields(
+        self,
+        chunks: list[dict],
+    ) -> list[dict]:
+
+        if not chunks:
+            return []
+
+        fields = []
+
+        seen = set()
+
+        for chunk in chunks:
+
+            content = str(
+                chunk.get(
+                    "content",
+                    "",
+                )
+            )
+
+            if not content:
+                continue
+
+            for line in content.splitlines():
+
+                normalized_line = (
+                    " ".join(
+                        line
+                        .strip()
+                        .split()
+                    )
+                )
+
+                if not normalized_line:
+                    continue
+
+                result = (
+                    self._split_document_label_value(
+                        normalized_line
+                    )
+                )
+
+                if not result:
+                    continue
+
+                label, value = result
+
+                dedupe_key = (
+                    label.lower(),
+                    value.lower(),
+                )
+
+                if dedupe_key in seen:
+                    continue
+
+                seen.add(
+                    dedupe_key
+                )
+
+                fields.append(
+                    {
+                        "label": label,
+                        "value": value,
+                        "source_line": (
+                            normalized_line
+                        ),
+                        "page_number": (
+                            chunk.get(
+                                "page_number"
+                            )
+                        ),
+                        "chunk_index": (
+                            chunk.get(
+                                "chunk_index"
+                            )
+                        ),
+                    }
+                )
+
+                if (
+                    len(fields)
+                    >= MAX_DOCUMENT_FIELD_CANDIDATES
+                ):
+                    return fields
+
+        return fields
+
+    # ============================================================
+    # EMBEDDING SIMILARITY
+    # ============================================================
+
+    @staticmethod
+    def _cosine_similarity(
+        vector_a,
+        vector_b,
+    ) -> float:
+
+        if not vector_a or not vector_b:
+            return 0.0
+
+        if len(vector_a) != len(vector_b):
+            return 0.0
+
+        dot_product = 0.0
+
+        magnitude_a = 0.0
+
+        magnitude_b = 0.0
+
+        for a, b in zip(
+            vector_a,
+            vector_b,
+        ):
+
+            a = float(a)
+            b = float(b)
+
+            dot_product += (
+                a * b
+            )
+
+            magnitude_a += (
+                a * a
+            )
+
+            magnitude_b += (
+                b * b
+            )
+
+        if (
+            magnitude_a == 0.0
+            or magnitude_b == 0.0
+        ):
+            return 0.0
+
+        return (
+            dot_product
+            / (
+                math.sqrt(
+                    magnitude_a
+                )
+                *
+                math.sqrt(
+                    magnitude_b
+                )
+            )
+        )
+
+    def _select_relevant_document_field(
+        self,
+        question: str,
+        fields: list[dict],
+    ) -> dict | None:
+
+        if not question:
+            return None
+
+        if not fields:
+            return None
+
+        try:
+
+            question_embedding = (
+                self.embedding_service.create_embedding(
+                    question.strip()
+                )
+            )
+
+        except Exception:
+            return None
+
+        if not question_embedding:
+            return None
+
+        best_field = None
+
+        best_score = -1.0
+
+        for field in fields:
+
+            label = str(
+                field.get(
+                    "label",
+                    "",
+                )
+            ).strip()
+
+            value = str(
+                field.get(
+                    "value",
+                    "",
+                )
+            ).strip()
+
+            if not label:
+                continue
+
+            field_text = (
+                f"{label}: {value}"
+            )
+
+            field_text = (
+                field_text[
+                    :MAX_DOCUMENT_FIELD_EMBEDDING_CHARS
+                ]
+            )
+
+            try:
+
+                field_embedding = (
+                    self.embedding_service.create_embedding(
+                        field_text
+                    )
+                )
+
+            except Exception:
+                continue
+
+            if not field_embedding:
+                continue
+
+            score = (
+                self._cosine_similarity(
+                    question_embedding,
+                    field_embedding,
+                )
+            )
+
+            if score > best_score:
+
+                best_score = score
+
+                best_field = field
+
+        if (
+            best_field is None
+            or best_score
+            < DOCUMENT_FIELD_SIMILARITY_THRESHOLD
+        ):
+            return None
+
+        selected_field = dict(
+            best_field
+        )
+
+        selected_field[
+            "similarity"
+        ] = best_score
+
+        return selected_field
+
+    # ============================================================
+    # DOCUMENT CHUNK FORMATTING
+    # ============================================================
+
+    def _format_document_chunks(
+        self,
+        chunks: list[dict],
+        max_chars: int,
+    ) -> str:
+
+        if not chunks:
+            return ""
+
+        sections = []
+
+        current_length = 0
+
+        for chunk in chunks:
+
+            content = str(
+                chunk.get(
+                    "content",
+                    "",
+                )
+            ).strip()
+
+            if not content:
+                continue
+
+            page_number = chunk.get(
+                "page_number"
+            )
+
+            chunk_index = chunk.get(
+                "chunk_index"
+            )
+
+            section = (
+                f"[Page {page_number} | "
+                f"Chunk {chunk_index}]\n"
+                f"{content}"
+            )
+
+            section_length = (
+                len(section) + 2
+            )
+
+            if (
+                current_length
+                + section_length
+                > max_chars
+            ):
+
+                remaining = (
+                    max_chars
+                    - current_length
+                )
+
+                if remaining > 100:
+
+                    sections.append(
+                        section[
+                            :remaining
+                        ]
+                    )
+
+                break
+
+            sections.append(
+                section
+            )
+
+            current_length += (
+                section_length
+            )
+
+        return "\n\n".join(
+            sections
+        )
+
+    def _build_label_value_evidence(
+        self,
+        chunks: list[dict],
+        max_chars: int,
+    ) -> str:
+
+        if not chunks:
+            return ""
+
+        fields = (
+            self._extract_document_fields(
+                chunks
+            )
+        )
+
+        if not fields:
+            return ""
+
+        sections = []
+
+        current_length = 0
+
+        for field in fields:
+
+            page_number = field.get(
+                "page_number"
+            )
+
+            chunk_index = field.get(
+                "chunk_index"
+            )
+
+            page_text = (
+                str(page_number)
+                if page_number is not None
+                else "N/A"
+            )
+
+            chunk_text = (
+                str(chunk_index)
+                if chunk_index is not None
+                else "N/A"
+            )
+
+            section = (
+                f"[Page {page_text} | "
+                f"Chunk {chunk_text}]\n"
+                f"Source line: "
+                f"{field.get('source_line')}\n"
+                f"Document field: "
+                f"{field.get('label')}\n"
+                f"Document value: "
+                f"{field.get('value')}"
+            )
+
+            section_length = (
+                len(section) + 2
+            )
+
+            if (
+                current_length
+                + section_length
+                > max_chars
+            ):
+                break
+
+            sections.append(
+                section
+            )
+
+            current_length += (
+                section_length
+            )
+
+        return "\n\n".join(
+            sections
+        )
+
+    # ============================================================
+    # GENERAL DOCUMENT CONTEXT
+    # ============================================================
 
     def _get_document_level_context(
         self,
         connection: Connection,
         document_id: int,
         question: str,
+        document: dict,
     ) -> str:
-        """
-        Retrieve document content for document-level questions.
 
-        The document header is always prioritized because voter-list
-        metadata such as constituency, part number, section name,
-        publication date, and total page count are normally stored
-        there.
+        all_chunks = (
+            self.retrieval_service.get_document_chunks(
+                connection=connection,
+                document_id=document_id,
+            )
+        )
 
-        Semantic retrieval is still used so this remains a generic
-        LLM-based document QA flow rather than a completely
-        rule-based system.
-        """
+        all_chunks = (
+            self._sort_document_chunks(
+                all_chunks
+            )
+        )
 
-        context_chunks = []
+        if not all_chunks:
+            return ""
 
-        # -----------------------------------------------------
-        # GET ALL DOCUMENT CHUNKS
-        # -----------------------------------------------------
+        header_chunks = all_chunks[
+            :HEADER_CHUNKS
+        ]
 
-        try:
+        semantic_chunks = (
+            self.retrieval_service.retrieve_relevant_chunks(
+                connection=connection,
+                document_id=document_id,
+                question=question,
+                top_k=SEMANTIC_TOP_K,
+                document_type=document.get(
+                    "document_type"
+                ),
+            )
+        )
 
-            document_chunks = (
-                self.retrieval_service
-                .get_document_chunks(
-                    connection=connection,
-                    document_id=document_id,
+        sections = []
+
+        if header_chunks:
+
+            header_text = (
+                self._format_document_chunks(
+                    header_chunks,
+                    MAX_DOCUMENT_CONTEXT_CHARS,
                 )
             )
 
-        except Exception as exc:
+            if header_text:
 
-            print(
-                "DEBUG: document chunk retrieval failed:"
-            )
+                sections.append(
+                    "DOCUMENT HEADER:\n"
+                    + header_text
+                )
 
-            print(exc)
+        if semantic_chunks:
 
-            document_chunks = []
-
-        # -----------------------------------------------------
-        # IDENTIFY DOCUMENT HEADER
-        #
-        # Chunk 0 is the dedicated header chunk created by the
-        # voter-list chunking pipeline.
-        # -----------------------------------------------------
-
-        header_chunk = None
-
-        for chunk in document_chunks:
-
-            if not isinstance(
-                chunk,
-                dict,
-            ):
-                continue
-
-            chunk_index = chunk.get(
-                "chunk_index"
-            )
-
-            if chunk_index == 0:
-
-                header_chunk = chunk
-                break
-
-        # -----------------------------------------------------
-        # FIRST: DOCUMENT HEADER
-        #
-        # Always prioritize the header for document-level
-        # metadata questions.
-        # -----------------------------------------------------
-
-        if header_chunk:
-
-            header_copy = dict(
-                header_chunk
-            )
-
-            header_copy[
-                "_document_header"
-            ] = True
-
-            context_chunks.append(
-                header_copy
-            )
-
-        # -----------------------------------------------------
-        # SECOND: SEMANTIC RETRIEVAL
-        #
-        # Keep semantic retrieval so document QA remains
-        # generic and can answer questions beyond metadata.
-        # -----------------------------------------------------
-
-        try:
-
-            semantic_chunks = (
-                self.retrieval_service
-                .retrieve_relevant_chunks(
-                    connection=connection,
-                    document_id=document_id,
-                    question=question,
-                    top_k=8,
+            semantic_text = (
+                self._format_document_chunks(
+                    semantic_chunks,
+                    MAX_DOCUMENT_CONTEXT_CHARS,
                 )
             )
 
-            if semantic_chunks:
+            if semantic_text:
 
-                context_chunks.extend(
+                sections.append(
+                    "RELEVANT DOCUMENT CONTENT:\n"
+                    + semantic_text
+                )
+
+        analysis_text = (
+            self._get_stored_analysis(
+                connection=connection,
+                document_id=document_id,
+            )
+        )
+
+        if analysis_text:
+
+            sections.append(
+                "DOCUMENT ANALYSIS:\n"
+                + analysis_text
+            )
+
+        context = "\n\n".join(
+            sections
+        )
+
+        return context[
+            :MAX_DOCUMENT_CONTEXT_CHARS
+        ]
+
+    # ============================================================
+    # DOCUMENT ANSWER CONTEXT
+    # ============================================================
+
+    def _get_document_answer_context(
+        self,
+        connection: Connection,
+        document_id: int,
+        question: str,
+        document: dict,
+    ) -> str:
+
+        all_chunks = (
+            self.retrieval_service.get_document_chunks(
+                connection=connection,
+                document_id=document_id,
+            )
+        )
+
+        all_chunks = (
+            self._sort_document_chunks(
+                all_chunks
+            )
+        )
+
+        if not all_chunks:
+            return ""
+
+        # --------------------------------------------------------
+        # HEADER
+        # --------------------------------------------------------
+
+        header_chunks = all_chunks[
+            :HEADER_CHUNKS
+        ]
+
+        header_fields = (
+            self._extract_document_fields(
+                header_chunks
+            )
+        )
+
+        selected_header_field = (
+            self._select_relevant_document_field(
+                question=question,
+                fields=header_fields,
+            )
+        )
+
+        if selected_header_field:
+
+            label = str(
+                selected_header_field.get(
+                    "label",
+                    "",
+                )
+            ).strip()
+
+            value = str(
+                selected_header_field.get(
+                    "value",
+                    "",
+                )
+            ).strip()
+
+            source_line = str(
+                selected_header_field.get(
+                    "source_line",
+                    "",
+                )
+            ).strip()
+
+            page_number = (
+                selected_header_field.get(
+                    "page_number"
+                )
+            )
+
+            chunk_index = (
+                selected_header_field.get(
+                    "chunk_index"
+                )
+            )
+
+            return (
+                "DOCUMENT EVIDENCE:\n"
+                f"Field: {label}\n"
+                f"Value: {value}\n"
+                f"Source: {source_line}\n"
+                f"Page: {page_number}\n"
+                f"Chunk: {chunk_index}"
+            )[
+                :MAX_DOCUMENT_ANSWER_CONTEXT_CHARS
+            ]
+
+        # --------------------------------------------------------
+        # SEMANTIC SEARCH
+        # --------------------------------------------------------
+
+        semantic_chunks = (
+            self.retrieval_service.retrieve_relevant_chunks(
+                connection=connection,
+                document_id=document_id,
+                question=question,
+                top_k=SEMANTIC_TOP_K,
+                document_type=document.get(
+                    "document_type"
+                ),
+            )
+        )
+
+        if semantic_chunks:
+
+            semantic_fields = (
+                self._extract_document_fields(
                     semantic_chunks
                 )
-
-        except Exception as exc:
-
-            print(
-                "DEBUG: semantic document retrieval failed:"
             )
 
-            print(exc)
-
-        # -----------------------------------------------------
-        # THIRD: EARLY DOCUMENT CHUNKS
-        #
-        # Include a few early chunks because additional
-        # document-level information can appear immediately
-        # after the header.
-        # -----------------------------------------------------
-
-        if document_chunks:
-
-            context_chunks.extend(
-                document_chunks[:5]
-            )
-
-        # -----------------------------------------------------
-        # REMOVE DUPLICATES
-        # -----------------------------------------------------
-
-        unique_chunks = {}
-
-        for chunk in context_chunks:
-
-            if not isinstance(
-                chunk,
-                dict,
-            ):
-                continue
-
-            chunk_id = chunk.get(
-                "id"
-            )
-
-            if chunk_id is not None:
-
-                key = (
-                    "id",
-                    chunk_id,
+            selected_semantic_field = (
+                self._select_relevant_document_field(
+                    question=question,
+                    fields=semantic_fields,
                 )
+            )
 
-            else:
+            if selected_semantic_field:
 
-                key = (
-                    "content",
-                    chunk.get(
-                        "content"
-                    ),
-                    chunk.get(
-                        "chunk_index"
-                    ),
-                    chunk.get(
+                label = str(
+                    selected_semantic_field.get(
+                        "label",
+                        "",
+                    )
+                ).strip()
+
+                value = str(
+                    selected_semantic_field.get(
+                        "value",
+                        "",
+                    )
+                ).strip()
+
+                source_line = str(
+                    selected_semantic_field.get(
+                        "source_line",
+                        "",
+                    )
+                ).strip()
+
+                page_number = (
+                    selected_semantic_field.get(
                         "page_number"
-                    ),
+                    )
                 )
 
-            if key not in unique_chunks:
-
-                unique_chunks[key] = chunk
-
-        # -----------------------------------------------------
-        # SORT DOCUMENT ORDER
-        #
-        # Header is explicitly kept first.
-        # -----------------------------------------------------
-
-        result = list(
-            unique_chunks.values()
-        )
-
-        result.sort(
-            key=lambda chunk: (
-                0
-                if chunk.get(
-                    "_document_header",
-                    False,
+                chunk_index = (
+                    selected_semantic_field.get(
+                        "chunk_index"
+                    )
                 )
-                else 1,
 
-                chunk.get(
-                    "page_number"
-                )
-                if chunk.get(
-                    "page_number"
-                ) is not None
-                else 999999,
+                return (
+                    "DOCUMENT EVIDENCE:\n"
+                    f"Field: {label}\n"
+                    f"Value: {value}\n"
+                    f"Source: {source_line}\n"
+                    f"Page: {page_number}\n"
+                    f"Chunk: {chunk_index}"
+                )[
+                    :MAX_DOCUMENT_ANSWER_CONTEXT_CHARS
+                ]
 
-                chunk.get(
-                    "chunk_index"
+            label_value_evidence = (
+                self._build_label_value_evidence(
+                    chunks=semantic_chunks,
+                    max_chars=MAX_LABEL_VALUE_EVIDENCE_CHARS,
                 )
-                if chunk.get(
-                    "chunk_index"
-                ) is not None
-                else 999999,
+            )
+
+            if label_value_evidence:
+
+                return label_value_evidence[
+                    :MAX_DOCUMENT_ANSWER_CONTEXT_CHARS
+                ]
+
+            raw_semantic_context = (
+                self._format_document_chunks(
+                    semantic_chunks,
+                    MAX_SEMANTIC_FALLBACK_CHARS,
+                )
+            )
+
+            if raw_semantic_context:
+
+                return raw_semantic_context[
+                    :MAX_DOCUMENT_ANSWER_CONTEXT_CHARS
+                ]
+
+        # --------------------------------------------------------
+        # HEADER FALLBACK
+        # --------------------------------------------------------
+
+        header_evidence = (
+            self._build_label_value_evidence(
+                chunks=header_chunks,
+                max_chars=MAX_LABEL_VALUE_EVIDENCE_CHARS,
             )
         )
 
-        # -----------------------------------------------------
-        # BUILD TEXT
-        # -----------------------------------------------------
+        if header_evidence:
 
-        context_parts = []
+            return header_evidence[
+                :MAX_DOCUMENT_ANSWER_CONTEXT_CHARS
+            ]
 
-        for chunk in result:
-
-            content = chunk.get(
-                "content",
-                "",
-            )
-
-            if not content:
-
-                continue
-
-            chunk_index = chunk.get(
-                "chunk_index"
-            )
-
-            page_number = chunk.get(
-                "page_number"
-            )
-
-            is_header = chunk.get(
-                "_document_header",
-                False,
-            )
-
-            # -------------------------------------------------
-            # DOCUMENT HEADER
-            # -------------------------------------------------
-
-            if is_header:
-
-                context_parts.append(
-                    "===== DOCUMENT HEADER =====\n"
-                    f"{content}\n"
-                    "===== END DOCUMENT HEADER ====="
-                )
-
-                continue
-
-            # -------------------------------------------------
-            # NORMAL CHUNK
-            # -------------------------------------------------
-
-            location = []
-
-            if page_number is not None:
-
-                location.append(
-                    f"Source Page {page_number}"
-                )
-
-            if chunk_index is not None:
-
-                location.append(
-                    f"Source Chunk {chunk_index}"
-                )
-
-            if location:
-
-                label = " | ".join(
-                    location
-                )
-
-                context_parts.append(
-                    f"[{label}]\n{content}"
-                )
-
-            else:
-
-                context_parts.append(
-                    content
-                )
-
-        return "\n\n".join(
-            context_parts
+        return self._format_document_chunks(
+            chunks=header_chunks,
+            max_chars=MAX_DOCUMENT_ANSWER_CONTEXT_CHARS,
         )
 
-    # =========================================================
-    # ANSWER DOCUMENT QUESTION
-    # =========================================================
+    # ============================================================
+    # GENERIC DOCUMENT QUESTION
+    # ============================================================
 
     def _answer_document_question(
         self,
         connection: Connection,
         document_id: int,
         question: str,
+        document: dict,
     ) -> str:
-        """
-        Answer questions about the document itself.
 
-        The answer is grounded only in extracted document text.
+        all_chunks = (
+            self.retrieval_service.get_document_chunks(
+                connection=connection,
+                document_id=document_id,
+            )
+        )
 
-        The document header is explicitly prioritized because it
-        contains important metadata such as:
+        all_chunks = (
+            self._sort_document_chunks(
+                all_chunks
+            )
+        )
 
-        - constituency
-        - part number
-        - section name
-        - publication date
-        - total page count
-        """
+        if not all_chunks:
+            return UNAVAILABLE_MESSAGE
 
-        context = (
-            self._get_document_level_context(
+        # --------------------------------------------------------
+        # HEADER FIELD SEARCH
+        # --------------------------------------------------------
+
+        header_chunks = all_chunks[
+            :HEADER_CHUNKS
+        ]
+
+        header_fields = (
+            self._extract_document_fields(
+                header_chunks
+            )
+        )
+
+        selected_header_field = (
+            self._select_relevant_document_field(
+                question=question,
+                fields=header_fields,
+            )
+        )
+
+        if selected_header_field:
+
+            value = str(
+                selected_header_field.get(
+                    "value",
+                    "",
+                )
+            ).strip()
+
+            if value:
+                return value
+
+        # --------------------------------------------------------
+        # SEMANTIC FIELD SEARCH
+        # --------------------------------------------------------
+
+        semantic_chunks = (
+            self.retrieval_service.retrieve_relevant_chunks(
                 connection=connection,
                 document_id=document_id,
                 question=question,
+                top_k=SEMANTIC_TOP_K,
+                document_type=document.get(
+                    "document_type"
+                ),
             )
         )
 
-        if not context.strip():
+        if semantic_chunks:
 
-            return (
-                "The requested information is not "
-                "available in the provided content."
+            semantic_fields = (
+                self._extract_document_fields(
+                    semantic_chunks
+                )
             )
 
-        # -----------------------------------------------------
-        # DETECT PAGE COUNT QUESTIONS
-        #
-        # This does NOT extract or hardcode the answer.
-        #
-        # It only gives the LLM additional instructions about
-        # how to interpret page-count metadata.
-        # -----------------------------------------------------
+            selected_semantic_field = (
+                self._select_relevant_document_field(
+                    question=question,
+                    fields=semantic_fields,
+                )
+            )
 
-        question_lower = (
-            question
-            .lower()
-            .strip()
+            if selected_semantic_field:
+
+                value = str(
+                    selected_semantic_field.get(
+                        "value",
+                        "",
+                    )
+                ).strip()
+
+                if value:
+                    return value
+
+        # --------------------------------------------------------
+        # LLM FALLBACK
+        # --------------------------------------------------------
+
+        context = (
+            self._get_document_answer_context(
+                connection=connection,
+                document_id=document_id,
+                question=question,
+                document=document,
+            )
         )
 
-        page_count_question = any(
-            phrase in question_lower
-            for phrase in [
-                "how many pages",
-                "how many page",
-                "total pages",
-                "total number of pages",
-                "number of pages",
-                "page count",
-                "page-count",
-                "pages are there",
-            ]
-        )
-
-        if page_count_question:
-
-            page_count_instruction = """
-IMPORTANT FOR PAGE COUNT QUESTIONS:
-
-The document header may contain several different numbers.
-
-When answering the total number of pages:
-
-- Look specifically for the document's total-page
-  information.
-- Tamil phrases such as "மொத்தப் பக்கங்கள்" mean
-  "total pages".
-- A value such as "மொத்தப் பக்கங்கள் 36" means the
-  document contains 36 total pages.
-- A phrase such as "பக்கம் 4" means the current page
-  number printed on that page. It does NOT mean that
-  the document has 4 pages.
-- "Page 4", "Source Page 4", "Chunk 0", and similar
-  retrieval labels are NOT the document's total page count.
-- Do not calculate the page count from the number of
-  retrieved chunks.
-- Do not use an arbitrary number from a voter record as
-  the page count.
-- If the document explicitly states a total page count,
-  use that value exactly.
-"""
-
-        else:
-
-            page_count_instruction = ""
+        if not context:
+            return UNAVAILABLE_MESSAGE
 
         prompt = f"""
-You are answering a question about a document.
+You are a document question-answering system.
 
-Use ONLY the document content provided below.
+Your ONLY source of truth is the DOCUMENT CONTENT provided below.
+
+You MUST answer the USER QUESTION using ONLY information that
+appears in the DOCUMENT CONTENT.
+
+Do NOT use:
+- general knowledge
+- internet knowledge
+- training knowledge
+- assumptions
+- guesses
+- outside information
 
 DOCUMENT CONTENT:
+----------------
 {context}
+----------------
 
 USER QUESTION:
 {question}
 
-{page_count_instruction}
+RULES:
 
-GENERAL RULES:
+1. Answer the user's question using only the document content.
+2. Do not add information from your own knowledge.
+3. Do not guess missing information.
+4. Preserve the original language/script when appropriate.
+5. If the question asks for a specific value, give the specific
+   value directly.
+6. If the question asks for a summary or explanation, summarize
+   only the information contained in the document.
+7. Do not mention unsupported information.
+8. If the requested information cannot be found, reply exactly:
 
-- Answer only from the provided document content.
-- Do not use outside knowledge.
-- Do not invent information.
-- Do not guess.
-- Do not assume information that is not explicitly present.
-- The section marked "DOCUMENT HEADER" contains source
-  metadata extracted from the document and should be
-  given priority for document-level metadata questions.
-- Retrieval labels such as "Source Page" and "Source Chunk"
-  are system-generated labels. They are NOT document facts.
-- Do not confuse a source/retrieval label with information
-  written inside the document.
-- If the requested information exists, give the direct
-  answer first.
-- If the requested information is not present, say:
+{UNAVAILABLE_MESSAGE}
 
-"The requested information is not available in the provided content."
+ANSWER:
+""".strip()
 
-- Preserve names, numbers, dates, and identifiers exactly
-  as they appear in the document when possible.
-- If the document contains Tamil text, preserve the Tamil
-  value when appropriate.
-- Do not turn unrelated OCR text into an answer.
-- Keep the answer clear and concise.
-"""
+        try:
 
-        # -----------------------------------------------------
-        # DEBUG CONTEXT
-        # -----------------------------------------------------
-
-        print(
-            "\n========== DOCUMENT QUESTION DEBUG =========="
-        )
-
-        print(
-            f"QUESTION: {question}"
-        )
-
-        print(
-            "DOCUMENT CONTEXT:"
-        )
-
-        print(
-            context
-        )
-
-        print(
-            "=============================================\n"
-        )
-
-        # -----------------------------------------------------
-        # FINAL LLM
-        # -----------------------------------------------------
-
-        answer = (
-            self.ollama_service
-            .generate_response(
-                prompt=prompt
+            answer = (
+                self.ollama_service.generate_response(
+                    prompt=prompt
+                )
             )
-        )
+
+        except Exception as exc:
+
+            raise ChatException(
+                f"Failed to generate document answer: {exc}"
+            ) from exc
 
         if not answer:
+            return UNAVAILABLE_MESSAGE
 
-            return (
-                "The requested information is not "
-                "available in the provided content."
-            )
+        answer = str(
+            answer
+        ).strip()
 
-        return answer.strip()
+        if not answer:
+            return UNAVAILABLE_MESSAGE
 
-    # =========================================================
-    # ANSWER VOTER QUESTION
-    # =========================================================
+        return answer
+
+    # ============================================================
+    # VOTER QUESTION
+    # ============================================================
 
     def _answer_voter_question(
         self,
         connection: Connection,
         document_id: int,
         question: str,
+        document: dict,
     ) -> str:
-        """
-        Voter-list question answering.
 
-        Flow:
+        # --------------------------------------------------------
+        # STEP 1
+        # Understand the natural-language question.
+        # --------------------------------------------------------
 
-        User question
-                ↓
-        VoterQueryService
-                ↓
-        Structured intent
-                ↓
-        ┌──────────────────────┐
-        │ document question?  │
-        └──────────┬───────────┘
-                   │
-             document context
-                   │
-                   ↓
-               Final LLM
+        query_info = (
+            self.voter_query_service.understand_query(
+                question
+            )
+        )
 
-        OR:
+        if not query_info:
+            return UNAVAILABLE_MESSAGE
 
-        Structured voter query
-                ↓
-        Python voter lookup
-                ↓
-        Requested fields
-                ↓
-        Verified context
-                ↓
-        Final LLM
-        """
+        lookup_type = str(
+            query_info.get(
+                "lookup_type",
+                "",
+            )
+        ).strip().lower()
 
-        try:
+        # --------------------------------------------------------
+        # DOCUMENT-LEVEL QUESTION
+        # --------------------------------------------------------
 
-            # -------------------------------------------------
-            # QUERY UNDERSTANDING
-            # -------------------------------------------------
+        if lookup_type == "document":
 
-            understood = (
-                self.voter_query_service
-                .understand_query(
-                    question
-                )
+            return self._answer_document_question(
+                connection=connection,
+                document_id=document_id,
+                question=question,
+                document=document,
             )
 
-            if not understood:
+        # --------------------------------------------------------
+        # STEP 2
+        # Load actual voter records.
+        # --------------------------------------------------------
 
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
+        records = self._get_voter_records(
+            connection=connection,
+            document_id=document_id,
+        )
 
-            lookup_type = understood.get(
-                "lookup_type"
+        if not records:
+            return UNAVAILABLE_MESSAGE
+
+        # --------------------------------------------------------
+        # STEP 3
+        # Perform Python lookup.
+        # --------------------------------------------------------
+
+        matched_records = (
+            self.voter_query_service.lookup_records(
+                records=records,
+                query=query_info,
+            )
+        )
+
+        # --------------------------------------------------------
+        # TARGETED NAME LOOKUP FALLBACK
+        # --------------------------------------------------------
+
+        if (
+            not matched_records
+            and lookup_type == "name"
+        ):
+
+            lookup_value = query_info.get(
+                "value"
             )
 
-            # -------------------------------------------------
-            # DOCUMENT-LEVEL QUESTION
-            # -------------------------------------------------
+            if lookup_value:
 
-            if lookup_type == "document":
-
-                return (
-                    self._answer_document_question(
-                        connection=connection,
-                        document_id=document_id,
-                        question=question,
+                requested_name = (
+                    str(
+                        lookup_value
                     )
+                    .strip()
+                    .casefold()
                 )
 
-            requested_fields = (
-                understood.get(
-                    "requested_fields",
-                    [],
-                )
-            )
+                fallback_matches = []
 
-            # -------------------------------------------------
-            # NORMALIZE REQUESTED FIELDS
-            # -------------------------------------------------
+                for record in records:
 
-            requested_fields = (
-                self._normalize_requested_fields(
-                    requested_fields
-                )
-            )
-
-            # -------------------------------------------------
-            # GET RECORDS
-            # -------------------------------------------------
-
-            records = (
-                self._get_voter_records(
-                    connection=connection,
-                    document_id=document_id,
-                )
-            )
-
-            # -------------------------------------------------
-            # DEBUG
-            # -------------------------------------------------
-
-            print(
-                "\n========== VOTER RECORD DEBUG =========="
-            )
-
-            print(
-                f"TOTAL RECORDS: {len(records)}"
-            )
-
-            for record in records:
-
-                if record.get(
-                    "serial_number"
-                ) in {
-                    10,
-                    11,
-                    12,
-                    13,
-                }:
-
-                    print(record)
-
-            print(
-                "========================================\n"
-            )
-
-            if not records:
-
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
-
-            # -------------------------------------------------
-            # COUNT
-            # -------------------------------------------------
-
-            if lookup_type == "count":
-
-                return (
-                    f"There are {len(records)} voters."
-                )
-
-            # -------------------------------------------------
-            # ALL
-            # -------------------------------------------------
-
-            if lookup_type == "all":
-
-                matched_records = records
-
-            else:
-
-                # ---------------------------------------------
-                # LOOKUP DEBUG
-                # ---------------------------------------------
-
-                print(
-                    "\n========== LOOKUP DEBUG =========="
-                )
-
-                print(
-                    f"LOOKUP TYPE: {lookup_type}"
-                )
-
-                print(
-                    "LOOKUP VALUE: "
-                    f"{understood.get('value')}"
-                )
-
-                print(
-                    "REQUESTED FIELDS: "
-                    f"{requested_fields}"
-                )
-
-                # ---------------------------------------------
-                # PYTHON RECORD LOOKUP
-                # ---------------------------------------------
-
-                matched_records = (
-                    self.voter_query_service
-                    .lookup_records(
-                        records=records,
-                        query=understood,
+                    record_name = record.get(
+                        "name"
                     )
-                )
 
-                print(
-                    "MATCHED COUNT: "
-                    f"{len(matched_records)}"
-                )
+                    if not record_name:
+                        continue
 
-                for record in matched_records:
+                    normalized_record_name = (
+                        str(
+                            record_name
+                        )
+                        .strip()
+                        .casefold()
+                    )
+
+                    if not normalized_record_name:
+                        continue
+
+                    if (
+                        normalized_record_name
+                        == requested_name
+                    ):
+
+                        fallback_matches.append(
+                            record
+                        )
+
+                        continue
+
+                    if (
+                        requested_name
+                        in normalized_record_name
+                        or normalized_record_name
+                        in requested_name
+                    ):
+
+                        fallback_matches.append(
+                            record
+                        )
+
+                if fallback_matches:
+
+                    matched_records = (
+                        fallback_matches
+                    )
 
                     print(
-                        "MATCHED RECORD:"
+                        "\n"
+                        "========== NAME LOOKUP FALLBACK =========="
                     )
 
-                    print(record)
+                    print(
+                        "LOOKUP VALUE:",
+                        lookup_value,
+                    )
 
-                print(
-                    "=================================\n"
-                )
+                    print(
+                        "FALLBACK MATCHED COUNT:",
+                        len(matched_records),
+                    )
 
-            # -------------------------------------------------
-            # NO MATCH
-            # -------------------------------------------------
-
-            if not matched_records:
-
-                print(
-                    "DEBUG: lookup_records() "
-                    "returned NO MATCH"
-                )
-
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
-
-            # -------------------------------------------------
-            # BUILD SAFE CONTEXT
-            # -------------------------------------------------
-
-            matched_context = (
-                self._build_requested_voter_context(
-                    matched_records=matched_records,
-                    requested_fields=requested_fields,
-                )
-            )
-
-            print(
-                "\n========== CONTEXT DEBUG =========="
-            )
-
-            print(
-                matched_context
-            )
-
-            print(
-                "===================================\n"
-            )
-
-            if not matched_context:
-
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
-
-            # -------------------------------------------------
-            # SINGLE RECORD + SINGLE FIELD
-            # -------------------------------------------------
-
-            if (
-                len(matched_records) == 1
-                and len(requested_fields) == 1
-            ):
-
-                field = requested_fields[0]
-
-                value = (
-                    self._get_voter_field_value(
+                    print(
+                        "FALLBACK MATCHED RECORD:",
                         matched_records[0],
-                        field,
                     )
+
+                    print(
+                        "=========================================="
+                    )
+
+        if not matched_records:
+            return UNAVAILABLE_MESSAGE
+
+        # --------------------------------------------------------
+        # COUNT
+        # --------------------------------------------------------
+
+        if lookup_type == "count":
+
+            voter_records = []
+
+            seen_serial_numbers = set()
+
+            for record in matched_records:
+
+                serial_number = record.get(
+                    "serial_number"
                 )
 
-                if value == "Not available":
+                try:
 
-                    return (
-                        "The requested information is not "
-                        "available in the provided content."
+                    serial_number = int(
+                        serial_number
                     )
 
-                field_lower = (
-                    field
-                    .lower()
-                    .strip()
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                if serial_number < 1:
+                    continue
+
+                if serial_number in seen_serial_numbers:
+                    continue
+
+                seen_serial_numbers.add(
+                    serial_number
                 )
 
-                field_display = (
-                    field
-                    .replace(
-                        "_",
-                        " ",
-                    )
-                    .title()
+                voter_records.append(
+                    record
                 )
 
-                # -------------------------------------------------
-                # NAME
-                # -------------------------------------------------
+            print(
+                "VOTER COUNT:",
+                len(voter_records),
+            )
 
-                if field_lower == "name":
+            if not voter_records:
+                return UNAVAILABLE_MESSAGE
 
-                    return (
-                        f"The voter's name is {value}."
-                    )
+            return (
+                f"There are "
+                f"{len(voter_records)} "
+                f"voters."
+            )
 
-                # -------------------------------------------------
-                # VOTER ID
-                # -------------------------------------------------
+        # --------------------------------------------------------
+        # REQUESTED FIELDS
+        # --------------------------------------------------------
 
-                if field_lower in {
-                    "epic",
-                    "epic_numbers",
-                    "voter_id",
-                }:
+        requested_fields = (
+            self._normalize_requested_fields(
+                query_info.get(
+                    "requested_fields"
+                )
+            )
+        )
 
-                    return (
-                        f"The Voter ID is {value}."
-                    )
+        # --------------------------------------------------------
+        # IMPORTANT:
+        #
+        # If an EPIC lookup has already found exactly one voter
+        # and the user asks for all information, keep the complete
+        # record and let the LLM explain it naturally.
+        #
+        # Do not convert this into an EPIC-only answer.
+        # --------------------------------------------------------
 
-                # -------------------------------------------------
-                # AGE
-                # -------------------------------------------------
+        if (
+            lookup_type == "epic"
+            and len(matched_records) == 1
+            and not requested_fields
+        ):
 
-                if field_lower == "age":
+            requested_fields = ["all"]
 
-                    return (
-                        f"The voter's age is {value}."
-                    )
+        # --------------------------------------------------------
+        # EXACT SINGLE-FIELD LOOKUP
+        #
+        # Python remains the source of truth for exact fields.
+        # --------------------------------------------------------
 
-                # -------------------------------------------------
-                # SERIAL NUMBER
-                # -------------------------------------------------
+        if (
+            len(matched_records) == 1
+            and len(requested_fields) == 1
+            and requested_fields[0] != "all"
+        ):
 
-                if field_lower == "serial_number":
+            record = matched_records[0]
 
-                    return (
-                        f"The serial number is {value}."
-                    )
+            requested_field = (
+                requested_fields[0]
+            )
 
-                # -------------------------------------------------
-                # GENDER
-                # -------------------------------------------------
+            # Normalize EPIC / voter ID aliases.
+            if requested_field in {
+                "epic",
+                "epic_number",
+                "epic_numbers",
+                "voter_id",
+                "voterid",
+                "voter_id_number",
+            }:
 
-                if field_lower == "gender":
-
-                    return (
-                        f"The voter's gender is {value}."
-                    )
-
-                # -------------------------------------------------
-                # HOUSE NUMBER
-                # -------------------------------------------------
-
-                if field_lower == "house_number":
-
-                    return (
-                        f"The house number is {value}."
-                    )
-
-                return (
-                    f"The {field_display} is {value}."
+                requested_field = (
+                    "epic_numbers"
                 )
 
-            # -------------------------------------------------
-            # MULTIPLE FIELDS / MULTIPLE RECORDS
-            # -------------------------------------------------
+            exact_value = (
+                self._get_voter_field_value(
+                    record=record,
+                    field_name=requested_field,
+                )
+            )
 
-            prompt = f"""
-You are answering a question about a voter-list document.
+            if exact_value == UNAVAILABLE_MESSAGE:
+                return UNAVAILABLE_MESSAGE
 
-Use ONLY the verified voter information provided below.
+            return exact_value
+
+        # --------------------------------------------------------
+        # MULTI-FIELD / GENERAL VOTER QUESTION
+        #
+        # This remains LLM-based.
+        # --------------------------------------------------------
+
+        complete_context = (
+            self._build_complete_voter_context(
+                matched_records
+            )
+        )
+
+        if not complete_context:
+            return UNAVAILABLE_MESSAGE
+
+        fields_text = ", ".join(
+            requested_fields
+        )
+
+        # --------------------------------------------------------
+        # ALL-FIELDS INSTRUCTION
+        #
+        # When the user asks for complete voter information,
+        # the LLM must explicitly include every available field.
+        # --------------------------------------------------------
+
+        if "all" in requested_fields:
+
+            fields_instruction = """
+The user requested COMPLETE information about the voter.
+
+You MUST explicitly include EVERY AVAILABLE FIELD from the
+verified voter record.
+
+When present, the answer MUST include:
+
+- Serial Number
+- Voter ID / EPIC Number
+- Name
+- Relation Type
+- Relation Name
+- House Number
+- Age
+- Gender
+- Any other voter-related field present in the verified record
+
+IMPORTANT:
+
+1. Do NOT omit the Serial Number.
+
+2. Do NOT omit the Voter ID / EPIC Number.
+
+3. Do NOT omit the Name.
+
+4. Do NOT omit the Relation Type when present.
+
+5. Do NOT omit the Relation Name when present.
+
+6. Do NOT omit the House Number when present.
+
+7. Do NOT omit the Age when present.
+
+8. Do NOT omit the Gender when present.
+
+9. Do NOT omit any other available voter-related field.
+
+10. Do NOT consider a field optional merely because another
+    field already identifies the voter.
+
+The answer MUST explicitly represent every available field
+from the verified record.
+
+For example, if the verified record contains:
+
+serial_number = 60
+epic_numbers = ["RMK0188789"]
+name = "சம்பு"
+relation_type = "தந்தை"
+relation_name = "பழனிசாமி"
+house_number = "14-9"
+age = 47
+gender = "ஆண்"
+
+the answer MUST include:
+
+Serial Number: 60
+Voter ID / EPIC Number: RMK0188789
+Name: சம்பு
+Relation Type: தந்தை
+Relation Name: பழனிசாமி
+House Number: 14-9
+Age: 47
+Gender: ஆண்
+
+You may write the answer naturally, but every available field
+must be clearly represented.
+
+Do NOT return only the person's name.
+
+Do NOT return only the voter ID.
+
+Do NOT return only the person's age.
+
+Do NOT return only the person's house number.
+
+Do NOT return only a short identification sentence.
+
+Do NOT give a partial summary when complete voter information
+is available.
+
+The goal is to describe the COMPLETE matched voter record.
+""".strip()
+
+        else:
+
+            fields_instruction = f"""
+The user requested these specific fields:
+
+{fields_text}
+
+Include EVERY requested field that is present in the
+verified voter record.
+
+Do not add unrelated fields unless needed to make the answer
+understandable.
+""".strip()
+
+        # --------------------------------------------------------
+        # FINAL LLM PROMPT
+        # --------------------------------------------------------
+
+        prompt = f"""
+You are answering a natural-language question using ONLY the
+verified voter record data extracted from the uploaded document.
+
+A Python lookup has ALREADY found the matching voter record.
+
+Therefore, the existence of the matching voter is VERIFIED.
+
+VOTER RECORD DATA:
+------------------
+{complete_context}
+------------------
 
 USER QUESTION:
 {question}
 
-VERIFIED VOTER INFORMATION:
-{matched_context}
-
 REQUESTED FIELDS:
-{", ".join(requested_fields)}
+{fields_text}
 
-Rules:
-- Answer only from the verified voter information.
-- Do not invent information.
-- Do not infer missing values.
-- Do not use outside knowledge.
-- Do not substitute serial number for Voter ID.
-- Do not substitute position for Voter ID.
-- Do not substitute age for Voter ID.
-- Do not substitute house number for Voter ID.
-- Voter ID means the actual EPIC number.
-- If Voter ID is requested, use only the value shown under
-  "Voter ID".
-- Do not add information that is not present.
-- If a requested value is "Not available", say that the
-  requested information is not available.
-- Answer naturally and concisely.
-"""
+{fields_instruction}
+
+IMPORTANT:
+
+The voter record above is the authoritative source of truth.
+
+The matching record has already been found by the application.
+
+You must answer the user's question from that record.
+
+Do NOT decide that the record is unavailable when the requested
+information is present above.
+
+RULES:
+
+1. Use ONLY the voter record data above.
+2. Do not use general knowledge.
+3. Do not use internet knowledge.
+4. Do not invent information.
+5. Do not guess information that is not present.
+6. Do not confuse serial number with voter ID / EPIC.
+7. Serial number is NOT an EPIC number.
+8. Position is NOT an EPIC number.
+9. Age is NOT an EPIC number.
+10. House number is NOT an EPIC number.
+11. Preserve Tamil names and original scripts.
+12. If the user asks for a person's details, use the matching
+    voter record.
+13. If the user asks "tell me about" a voter, provide the
+    COMPLETE available details from the matched voter record.
+14. If REQUESTED FIELDS contains "all", include EVERY available
+    field from the matched voter record.
+15. If the user identifies a voter using a voter ID / EPIC,
+    use that voter record to answer the question.
+16. Do not simply repeat the voter ID when the user asks for
+    information about the voter.
+17. If the user asks who has a particular voter ID, provide the
+    person's name if the name is present.
+18. If the user asks for the voter ID itself, provide the EPIC
+    number from epic_numbers.
+19. Only say that information is unavailable when the specific
+    requested information is genuinely absent from the verified
+    voter record.
+
+ANSWER:
+""".strip()
+
+        try:
 
             answer = (
-                self.ollama_service
-                .generate_response(
+                self.ollama_service.generate_response(
                     prompt=prompt
                 )
             )
 
-            if not answer:
-
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
-
-            return answer.strip()
-
-        except ChatException:
-
-            raise
-
         except Exception as exc:
 
             raise ChatException(
-                f"Failed to answer voter question: {exc}"
+                f"Failed to generate voter answer: {exc}"
             ) from exc
 
-    # =========================================================
-    # GENERIC DOCUMENT CONTEXT
-    # =========================================================
+        if not answer:
+            return UNAVAILABLE_MESSAGE
 
-    def _get_generic_document_context(
-        self,
-        connection: Connection,
-        document_id: int,
-        question: str,
-    ):
+        answer = str(
+            answer
+        ).strip()
 
-        context_chunks = []
+        if not answer:
+            return UNAVAILABLE_MESSAGE
 
-        # -----------------------------------------------------
-        # SEMANTIC RETRIEVAL
-        # -----------------------------------------------------
+        # --------------------------------------------------------
+        # LLM SAFETY RETRY
+        #
+        # Sometimes a small model may incorrectly return the
+        # unavailable message even though Python already verified
+        # the record.
+        #
+        # Retry only for a matched multi-field/general question.
+        # This does NOT replace the normal LLM flow.
+        # --------------------------------------------------------
 
-        try:
-
-            semantic_chunks = (
-                self.retrieval_service
-                .retrieve_relevant_chunks(
-                    connection=connection,
-                    document_id=document_id,
-                    question=question,
-                    top_k=3,
-                )
+        if (
+            answer.casefold()
+            == UNAVAILABLE_MESSAGE.casefold()
+            and matched_records
+            and (
+                "all" in requested_fields
+                or len(requested_fields) > 1
             )
+        ):
 
-            if semantic_chunks:
+            retry_prompt = f"""
+You have been given a VERIFIED voter record.
 
-                context_chunks.extend(
-                    semantic_chunks
+The application already found an exact matching voter.
+
+Do NOT say that the information is unavailable.
+
+Use the verified record below to answer the user's question.
+
+VERIFIED VOTER RECORD:
+----------------------
+{complete_context}
+----------------------
+
+USER QUESTION:
+{question}
+
+REQUESTED FIELDS:
+{fields_text}
+
+{fields_instruction}
+
+IMPORTANT:
+
+The verified voter record above is the authoritative source
+of truth.
+
+The matching voter has already been found by Python.
+
+You MUST answer using the verified record.
+
+Do NOT invent missing values.
+
+Do NOT substitute one field for another.
+
+For example:
+
+- Serial Number is NOT the Voter ID.
+- Position is NOT the Voter ID.
+- Age is NOT the Voter ID.
+- House Number is NOT the Voter ID.
+
+If the user asks to tell them about the voter, provide the
+COMPLETE available details from the verified voter record.
+
+When REQUESTED FIELDS contains "all", EVERY available field
+must be explicitly represented in the answer.
+
+Preserve Tamil names and original scripts.
+
+The requested information is available in the verified record,
+so provide the complete answer directly.
+
+ANSWER:
+""".strip()
+
+            try:
+
+                retry_answer = (
+                    self.ollama_service.generate_response(
+                        prompt=retry_prompt
+                    )
                 )
 
-        except Exception:
+            except Exception as exc:
 
-            semantic_chunks = []
+                raise ChatException(
+                    f"Failed to generate voter retry answer: {exc}"
+                ) from exc
 
-        # -----------------------------------------------------
-        # DOCUMENT CHUNKS
-        # -----------------------------------------------------
+            if retry_answer:
 
-        try:
+                retry_answer = str(
+                    retry_answer
+                ).strip()
 
-            document_chunks = (
-                self.retrieval_service
-                .get_document_chunks(
-                    connection=connection,
-                    document_id=document_id,
-                )
-            )
+                if (
+                    retry_answer
+                    and retry_answer.casefold()
+                    != UNAVAILABLE_MESSAGE.casefold()
+                ):
 
-            if document_chunks:
+                    return retry_answer
 
-                context_chunks.extend(
-                    document_chunks[:2]
-                )
+        return answer
 
-        except Exception:
-
-            document_chunks = []
-
-        # -----------------------------------------------------
-        # REMOVE DUPLICATES
-        # -----------------------------------------------------
-
-        unique_chunks = {}
-
-        for chunk in context_chunks:
-
-            chunk_id = chunk.get(
-                "id"
-            )
-
-            if chunk_id is not None:
-
-                key = chunk_id
-
-            else:
-
-                key = (
-                    chunk.get(
-                        "chunk_index"
-                    ),
-                    chunk.get(
-                        "content"
-                    ),
-                )
-
-            if key not in unique_chunks:
-
-                unique_chunks[key] = chunk
-
-        # -----------------------------------------------------
-        # SORT BY CHUNK INDEX
-        # -----------------------------------------------------
-
-        result = list(
-            unique_chunks.values()
-        )
-
-        result.sort(
-            key=lambda chunk: (
-                chunk.get(
-                    "chunk_index"
-                )
-                if chunk.get(
-                    "chunk_index"
-                ) is not None
-                else 999999
-            )
-        )
-
-        return result
-
-    # =========================================================
-    # MAIN CHAT METHOD
-    # =========================================================
+    # ============================================================
+    # MAIN ANSWER METHOD
+    # ============================================================
 
     def answer_question(
         self,
@@ -1529,325 +2206,106 @@ Rules:
         question: str,
     ) -> str:
 
-        try:
-
-            # -------------------------------------------------
-            # VALIDATE QUESTION
-            # -------------------------------------------------
-
-            question = question.strip()
-
-            if not question:
-
-                raise ChatException(
-                    "Question cannot be empty."
-                )
-
-            # -------------------------------------------------
-            # GET DOCUMENT
-            # -------------------------------------------------
-
-            document = (
-                self.document_repository
-                .get_by_id(
-                    connection,
-                    document_id,
-                )
-            )
-
-            if not document:
-
-                raise ChatException(
-                    "Document not found."
-                )
-
-            # -------------------------------------------------
-            # DOCUMENT REPOSITORY RETURNS:
-            #
-            # 0 -> id
-            # 1 -> filename
-            # 2 -> file_type
-            # 3 -> document_type
-            # 4 -> file_path
-            # 5 -> status
-            # 6 -> created_at
-            # -------------------------------------------------
-
-            filename = document[1]
-
-            document_type = document[3]
-
-            filename = (
-                filename
-                if filename
-                else ""
-            )
-
-            document_type = (
-                document_type
-                if document_type
-                else ""
-            )
-
-            # =================================================
-            # IMAGE FLOW
-            # =================================================
-
-            if self._is_image(
-                filename
-            ):
-
-                analysis = (
-                    self.analysis_repository
-                    .get_by_document_id(
-                        connection,
-                        document_id,
-                    )
-                )
-
-                if analysis:
-
-                    if isinstance(
-                        analysis,
-                        dict,
-                    ):
-
-                        analysis_text = (
-                            analysis.get(
-                                "analysis",
-                                "",
-                            )
-                        )
-
-                    else:
-
-                        analysis_text = (
-                            getattr(
-                                analysis,
-                                "analysis",
-                                "",
-                            )
-                        )
-
-                    if analysis_text:
-
-                        prompt = f"""
-You are answering a question about an image.
-
-IMAGE ANALYSIS:
-{analysis_text}
-
-USER QUESTION:
-{question}
-
-Rules:
-- Answer only from the image analysis.
-- Do not invent information.
-- Do not use outside knowledge.
-- If the answer is not present, say:
-
-"The requested information is not available in the provided content."
-
-- Keep the answer concise.
-"""
-
-                        return (
-                            self.ollama_service
-                            .generate_response(
-                                prompt=prompt
-                            )
-                        )
-
-            # =================================================
-            # VOTER LIST FLOW
-            # =================================================
-
-            if document_type == "voter_list":
-
-                return (
-                    self._answer_voter_question(
-                        connection=connection,
-                        document_id=document_id,
-                        question=question,
-                    )
-                )
-
-            # =================================================
-            # GENERIC DOCUMENT RAG
-            # =================================================
-
-            understood_question = (
-                self.ollama_service
-                .understand_question(
-                    question
-                )
-            )
-
-            if not understood_question:
-
-                understood_question = question
-
-            # -------------------------------------------------
-            # HYBRID RETRIEVAL
-            # -------------------------------------------------
-
-            retrieved_chunks = (
-                self._get_generic_document_context(
-                    connection=connection,
-                    document_id=document_id,
-                    question=understood_question,
-                )
-            )
-
-            # -------------------------------------------------
-            # NO CONTEXT
-            # -------------------------------------------------
-
-            if not retrieved_chunks:
-
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
-
-            # -------------------------------------------------
-            # BUILD CONTEXT
-            # -------------------------------------------------
-
-            context_parts = []
-
-            for chunk in retrieved_chunks:
-
-                content = chunk.get(
-                    "content",
-                    "",
-                )
-
-                if not content:
-                    continue
-
-                chunk_index = chunk.get(
-                    "chunk_index"
-                )
-
-                page_number = chunk.get(
-                    "page_number"
-                )
-
-                location = []
-
-                if chunk_index is not None:
-
-                    location.append(
-                        f"Chunk {chunk_index}"
-                    )
-
-                if page_number is not None:
-
-                    location.append(
-                        f"Page {page_number}"
-                    )
-
-                if location:
-
-                    label = " | ".join(
-                        location
-                    )
-
-                    context_parts.append(
-                        f"[{label}]\n{content}"
-                    )
-
-                else:
-
-                    context_parts.append(
-                        content
-                    )
-
-            context = "\n\n".join(
-                context_parts
-            )
-
-            # -------------------------------------------------
-            # FINAL LLM PROMPT
-            # -------------------------------------------------
-
-            prompt = f"""
-You are a document question-answering assistant.
-
-Answer the user's question using ONLY the provided document
-content.
-
-DOCUMENT CONTENT:
-{context}
-
-USER QUESTION:
-{question}
-
-Rules:
-- Use only information present in the document content.
-- Do not use outside knowledge.
-- Do not invent facts.
-- Do not assume information that is not explicitly present.
-- If the answer is not available in the provided content, say:
-
-"The requested information is not available in the provided content."
-
-- For summaries, summarize the information actually present
-  in the provided document content.
-- For factual questions, give the direct answer first.
-- Keep the answer clear and concise.
-"""
-
-            # -------------------------------------------------
-            # FINAL GENERATION
-            # -------------------------------------------------
-
-            answer = (
-                self.ollama_service
-                .generate_response(
-                    prompt=prompt
-                )
-            )
-
-            if not answer:
-
-                return (
-                    "The requested information is not "
-                    "available in the provided content."
-                )
-
-            return answer.strip()
-
-        except ChatException:
-
-            raise
-
-        except Exception as exc:
+        if not question or not question.strip():
 
             raise ChatException(
-                f"Failed to answer question: {exc}"
-            ) from exc
+                "Question cannot be empty."
+            )
+
+        question = question.strip()
+
+        # --------------------------------------------------------
+        # LOAD DOCUMENT
+        # --------------------------------------------------------
+
+        document_row = (
+            self.document_repository.get_by_id(
+                connection=connection,
+                document_id=document_id,
+            )
+        )
+
+        if not document_row:
+
+            raise ChatException(
+                "Document not found."
+            )
+
+        document = (
+            self._document_row_to_dict(
+                document_row
+            )
+        )
+
+        # --------------------------------------------------------
+        # IMAGE
+        # --------------------------------------------------------
+
+        if self._is_image(
+            document
+        ):
+
+            return self._answer_image_question(
+                connection=connection,
+                document_id=document_id,
+                question=question,
+                document=document,
+            )
+
+        # --------------------------------------------------------
+        # DOCUMENT TYPE
+        # --------------------------------------------------------
+
+        document_type = str(
+            document.get(
+                "document_type",
+                "",
+            )
+        ).strip().lower()
+
+        # --------------------------------------------------------
+        # VOTER LIST
+        # --------------------------------------------------------
+
+        if document_type == "voter_list":
+
+            return self._answer_voter_question(
+                connection=connection,
+                document_id=document_id,
+                question=question,
+                document=document,
+            )
+
+        # --------------------------------------------------------
+        # GENERIC DOCUMENT
+        # --------------------------------------------------------
+
+        return self._answer_document_question(
+            connection=connection,
+            document_id=document_id,
+            question=question,
+            document=document,
+        )
 
 
-# =============================================================
+# ================================================================
 # SERVICE INITIALIZATION
-# =============================================================
+# ================================================================
+
+document_repository = DocumentRepository()
 
 chunk_repository = ChunkRepository()
 
 analysis_repository = AnalysisRepository()
 
-document_repository = DocumentRepository()
-
 embedding_service = EmbeddingService()
+
+ollama_service = OllamaService()
 
 retrieval_service = RetrievalService(
     chunk_repository=chunk_repository,
     embedding_service=embedding_service,
 )
-
-ollama_service = OllamaService()
 
 voter_record_service = VoterRecordService()
 
@@ -1856,10 +2314,11 @@ voter_query_service = VoterQueryService(
 )
 
 chat_service = ChatService(
+    document_repository=document_repository,
     chunk_repository=chunk_repository,
     analysis_repository=analysis_repository,
-    document_repository=document_repository,
     retrieval_service=retrieval_service,
+    embedding_service=embedding_service,
     ollama_service=ollama_service,
     voter_record_service=voter_record_service,
     voter_query_service=voter_query_service,

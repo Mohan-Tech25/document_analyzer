@@ -538,6 +538,942 @@ class AnalysisService:
         return evidence
 
     # ========================================================
+    # EXTRACT DOCUMENT TYPE FROM LLM RESPONSE
+    # ========================================================
+
+
+    # ========================================================
+    # EXTRACT DOCUMENT TYPE FROM LLM RESPONSE
+    # ========================================================
+
+    
+    # ========================================================
+    # EXTRACT DOCUMENT TYPE FROM LLM RESPONSE
+    # ========================================================
+
+    def _extract_document_type(
+        self,
+        summary: str,
+    ) -> str | None:
+        """
+        Extract the document type from the LLM response.
+
+        Supported formats:
+
+            Document Type: Resume
+
+            **Document Type:** Resume
+
+            Document Type:
+            * Resume
+
+            **Document Type**
+            - Resume
+
+        Important:
+        The parser requires an exact "Document Type" label.
+
+        It must NOT accidentally match:
+
+            Document Type Evidence:
+            Document Type Context:
+            Document Type Information:
+        """
+
+        if not summary:
+            return None
+
+        lines = summary.splitlines()
+
+        for index, line in enumerate(lines):
+
+            # ------------------------------------------------
+            # Clean current line
+            # ------------------------------------------------
+
+            cleaned_line = line.strip()
+
+            # Remove markdown bold markers.
+            cleaned_line = cleaned_line.replace(
+                "**",
+                "",
+            ).strip()
+
+            # Remove markdown heading markers.
+            cleaned_line = re.sub(
+                r"^#+\s*",
+                "",
+                cleaned_line,
+            ).strip()
+
+            # ------------------------------------------------
+            # FORMAT 1
+            #
+            # Document Type: Educational Framework
+            #
+            # **Document Type:** Educational Framework
+            # ------------------------------------------------
+
+            match = re.match(
+                r"^Document\s+Type\s*:\s*(.*)$",
+                cleaned_line,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+
+                value = match.group(1).strip()
+
+                # Remove markdown bullets.
+                value = re.sub(
+                    r"^\s*(?:[-*•]\s*)+",
+                    "",
+                    value,
+                ).strip()
+
+                if value:
+                    return value
+
+                # --------------------------------------------
+                # Value may be on the next line.
+                # --------------------------------------------
+
+                for next_line in lines[index + 1:]:
+
+                    value = next_line.strip()
+
+                    if not value:
+                        continue
+
+                    value = value.replace(
+                        "**",
+                        "",
+                    ).strip()
+
+                    value = re.sub(
+                        r"^\s*(?:[-*•]\s*)+",
+                        "",
+                        value,
+                    ).strip()
+
+                    if value:
+                        return value
+
+                    break
+
+            # ------------------------------------------------
+            # FORMAT 2
+            #
+            # Document Type
+            # Educational Framework
+            #
+            # Important:
+            # Exact match only.
+            #
+            # This prevents:
+            #
+            # Document Type Evidence
+            #
+            # from being treated as the document type.
+            # ------------------------------------------------
+
+            if re.fullmatch(
+                r"Document\s+Type",
+                cleaned_line,
+                flags=re.IGNORECASE,
+            ):
+
+                for next_line in lines[index + 1:]:
+
+                    value = next_line.strip()
+
+                    if not value:
+                        continue
+
+                    # Stop if we reached another heading.
+                    cleaned_next = value.replace(
+                        "**",
+                        "",
+                    ).strip()
+
+                    if re.fullmatch(
+                        r"Document\s+Type\s+Evidence",
+                        cleaned_next,
+                        flags=re.IGNORECASE,
+                    ):
+                        break
+
+                    value = cleaned_next
+
+                    value = re.sub(
+                        r"^\s*(?:[-*•]\s*)+",
+                        "",
+                        value,
+                    ).strip()
+
+                    if value:
+                        return value
+
+                    break
+
+        return None
+
+
+        # ----------------------------------------------------
+        # Helper
+        # ----------------------------------------------------
+
+        def clean_document_type(
+            value: str,
+        ) -> str | None:
+            """
+            Clean markdown formatting and common sentence
+            wrappers around the actual document type.
+            """
+
+            if not value:
+                return None
+
+            value = value.strip()
+
+            # Remove markdown bullets.
+            value = re.sub(
+                r"^\s*[-*•]\s*",
+                "",
+                value,
+            )
+
+            # Remove markdown bold markers.
+            value = value.replace(
+                "**",
+                "",
+            )
+
+            # Remove surrounding whitespace.
+            value = value.strip()
+
+            if not value:
+                return None
+
+            # ------------------------------------------------
+            # Pattern:
+            #
+            # classify it as an **Educational Framework**
+            # document
+            #
+            # After markdown removal:
+            #
+            # classify it as an Educational Framework document
+            # ------------------------------------------------
+
+            classification_match = re.search(
+                r"""
+                \b
+                (?:classify|classified|classification)
+                \s+
+                (?:it|the\s+document)
+                \s+
+                as
+                \s+
+                (?:an?\s+)?
+                (?P<type>.+?)
+                \s+
+                document
+                \b
+                """,
+                value,
+                flags=re.IGNORECASE | re.VERBOSE,
+            )
+
+            if classification_match:
+
+                document_type = (
+                    classification_match
+                    .group("type")
+                    .strip()
+                    .strip(" .,:;-")
+                )
+
+                if document_type:
+                    return document_type
+
+            # ------------------------------------------------
+            # Pattern:
+            #
+            # is an Educational Framework document
+            # ------------------------------------------------
+
+            is_document_match = re.search(
+                r"""
+                \b
+                is
+                \s+
+                (?:an?\s+)?
+                (?P<type>.+?)
+                \s+
+                document
+                \b
+                """,
+                value,
+                flags=re.IGNORECASE | re.VERBOSE,
+            )
+
+            if is_document_match:
+
+                document_type = (
+                    is_document_match
+                    .group("type")
+                    .strip()
+                    .strip(" .,:;-")
+                )
+
+                if document_type:
+                    return document_type
+
+            # ------------------------------------------------
+            # Pattern:
+            #
+            # Educational Framework document
+            #
+            # If the candidate itself ends with "document",
+            # remove that suffix.
+            # ------------------------------------------------
+
+            document_type = re.sub(
+                r"\s+document\s*$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            if document_type:
+                return document_type
+
+            return None
+
+        # ====================================================
+        # FORMAT 1
+        #
+        # Document Type: Educational Framework
+        #
+        # Also supports:
+        #
+        # **Document Type:** Educational Framework
+        #
+        # ====================================================
+
+        match = re.search(
+            r"""
+            ^\s*
+            (?:\*\*)?
+            Document\s+Type
+            (?:\*\*)?
+            \s*:\s*
+            (?P<type>.+?)
+            \s*$
+            """,
+            summary,
+            flags=(
+                re.IGNORECASE
+                | re.MULTILINE
+                | re.VERBOSE
+            ),
+        )
+
+        if match:
+
+            document_type = clean_document_type(
+                match.group("type")
+            )
+
+            if document_type:
+                return document_type
+
+        # ====================================================
+        # FORMAT 2
+        #
+        # Markdown heading:
+        #
+        # **Document Type**
+        #
+        # Followed by:
+        #
+        # * **Educational Framework**
+        #
+        # ====================================================
+
+        heading_match = re.search(
+            r"""
+            ^\s*
+            \*\*
+            \s*Document\s+Type\s*
+            \*\*
+            \s*$
+            (?P<body>.*?)
+            (?=
+                ^\s*
+                \*\*
+                \s*Document\s+Type\s+Evidence
+                \s*
+                \*\*
+                \s*$
+            )
+            """,
+            summary,
+            flags=(
+                re.IGNORECASE
+                | re.MULTILINE
+                | re.DOTALL
+                | re.VERBOSE
+            ),
+        )
+
+        if heading_match:
+
+            body = heading_match.group("body")
+
+            # ------------------------------------------------
+            # First look for a sentence containing:
+            #
+            # classify it as an **X** document
+            #
+            # This MUST happen before generic line extraction.
+            # ------------------------------------------------
+
+            classification_match = re.search(
+                r"""
+                \b
+                (?:classify|classified|classification)
+                \s+
+                (?:it|the\s+document)
+                \s+
+                as
+                \s+
+                (?:an?\s+)?
+                (?:\*\*)?
+                (?P<type>.+?)
+                (?:\*\*)?
+                \s+
+                document
+                \b
+                """,
+                body,
+                flags=(
+                    re.IGNORECASE
+                    | re.DOTALL
+                    | re.VERBOSE
+                ),
+            )
+
+            if classification_match:
+
+                document_type = (
+                    classification_match
+                    .group("type")
+                    .strip()
+                    .strip("*")
+                    .strip()
+                    .strip(".,:;-")
+                )
+
+                if document_type:
+
+                    return document_type
+
+            # ------------------------------------------------
+            # Look for a markdown bullet.
+            #
+            # Example:
+            #
+            # * **General Informational / Reference Document**
+            #
+            # ------------------------------------------------
+
+            bullet_matches = re.findall(
+                r"""
+                ^\s*
+                [-*•]
+                \s*
+                (?:\*\*)?
+                (?P<type>.+?)
+                (?:\*\*)?
+                \s*$
+                """,
+                body,
+                flags=(
+                    re.MULTILINE
+                    | re.VERBOSE
+                ),
+            )
+
+            for candidate in bullet_matches:
+
+                document_type = clean_document_type(
+                    candidate
+                )
+
+                if not document_type:
+                    continue
+
+                lowered = document_type.lower()
+
+                # Ignore explanatory bullets.
+                if lowered.startswith(
+                    "the most specific document type"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "the document type"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "based on the content"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "according to"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "supported by"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "the classification"
+                ):
+                    continue
+
+                if (
+                    "document type evidence" in lowered
+                ):
+                    continue
+
+                return document_type
+
+            # ------------------------------------------------
+            # Look for a clean standalone line.
+            #
+            # Example:
+            #
+            # **Document Type**
+            #
+            # Educational Framework
+            #
+            # ------------------------------------------------
+
+            body_lines = body.splitlines()
+
+            for line in body_lines:
+
+                candidate = (
+                    line
+                    .strip()
+                    .strip("*")
+                    .strip()
+                )
+
+                if not candidate:
+                    continue
+
+                lowered = candidate.lower()
+
+                # Skip explanatory sentences.
+                if lowered.startswith(
+                    "based on the content"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "the most specific document type"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "the document type"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "according to"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "supported by"
+                ):
+                    continue
+
+                if lowered.startswith(
+                    "document type evidence"
+                ):
+                    continue
+
+                # Skip section headings.
+                if lowered in {
+                    "summary",
+                    "document context",
+                    "information structure",
+                    "record information",
+                    "classification priority",
+                    "document-level behavior",
+                    "record count rule",
+                    "task",
+                }:
+                    continue
+
+                # If this is a classification sentence,
+                # extract the type from it.
+                extracted = clean_document_type(
+                    candidate
+                )
+
+                if extracted:
+
+                    # Avoid returning long explanatory text.
+                    if len(extracted) <= 120:
+                        return extracted
+
+        # ====================================================
+        # FORMAT 3
+        #
+        # Some models return:
+        #
+        # Document Type
+        # Educational Framework
+        #
+        # without markdown.
+        #
+        # ====================================================
+
+        lines = summary.splitlines()
+
+        for index, line in enumerate(lines):
+
+            cleaned_line = (
+                line
+                .strip()
+                .strip("*")
+                .strip()
+            )
+
+            if cleaned_line.lower() != "document type":
+                continue
+
+            # Search the next several lines.
+            for next_line in lines[
+                index + 1:index + 10
+            ]:
+
+                candidate = (
+                    next_line
+                    .strip()
+                    .strip("*")
+                    .strip()
+                    .strip("-")
+                    .strip("•")
+                    .strip()
+                )
+
+                if not candidate:
+                    continue
+
+                lowered_candidate = (
+                    candidate.lower()
+                )
+
+                # Stop at the next section.
+                if lowered_candidate.startswith(
+                    "document type evidence"
+                ):
+                    break
+
+                # Skip explanatory text.
+                if (
+                    lowered_candidate.startswith(
+                        "the most specific document type"
+                    )
+                    or lowered_candidate.startswith(
+                        "the document type"
+                    )
+                    or lowered_candidate.startswith(
+                        "supported by"
+                    )
+                    or lowered_candidate.startswith(
+                        "based on the content"
+                    )
+                    or lowered_candidate.startswith(
+                        "according to"
+                    )
+                ):
+                    # However, this line may contain the actual
+                    # classification inside the sentence.
+                    extracted = clean_document_type(
+                        candidate
+                    )
+
+                    if extracted and extracted != candidate:
+                        return extracted
+
+                    continue
+
+                extracted = clean_document_type(
+                    candidate
+                )
+
+                if extracted:
+
+                    if len(extracted) <= 120:
+                        return extracted
+
+        # ====================================================
+        # FORMAT 4
+        #
+        # Fallback:
+        #
+        # "Document Type" appears somewhere in the response,
+        # followed by a sentence containing:
+        #
+        # "classify it as an Educational Framework document"
+        #
+        # ====================================================
+
+        fallback_classification = re.search(
+            r"""
+            \b
+            (?:classify|classified|classification)
+            \s+
+            (?:it|the\s+document)
+            \s+
+            as
+            \s+
+            (?:an?\s+)?
+            (?:\*\*)?
+            (?P<type>.+?)
+            (?:\*\*)?
+            \s+
+            document
+            \b
+            """,
+            summary,
+            flags=(
+                re.IGNORECASE
+                | re.DOTALL
+                | re.VERBOSE
+            ),
+        )
+
+        if fallback_classification:
+
+            document_type = (
+                fallback_classification
+                .group("type")
+                .strip()
+                .strip("*")
+                .strip()
+                .strip(".,:;-")
+            )
+
+            if document_type:
+
+                return document_type
+
+        return None
+
+    # ========================================================
+    # VALIDATE DOCUMENT TYPE
+    # ========================================================
+
+    def _validate_document_type(
+        self,
+        document_type: str | None,
+        document_text: str,
+        structural_evidence: list[str],
+    ) -> str:
+        """
+        Validate the document type returned by the LLM.
+
+        The LLM interprets the document, but it must not claim
+        structural evidence that does not exist.
+
+        This specifically protects against a general document
+        about democracy/government being incorrectly classified
+        as an Electoral Roll / Voter List.
+        """
+
+        if not document_type:
+
+            return (
+                "The specific document type cannot be determined "
+                "from the available document content."
+            )
+
+        normalized_type = document_type.strip()
+
+        normalized_text = (
+            self._normalize_text(
+                document_text
+            ).lower()
+        )
+
+        # ----------------------------------------------------
+        # Detect Electoral Roll / Voter List classification.
+        # ----------------------------------------------------
+
+        voter_type = (
+            "electoral roll" in normalized_type.lower()
+            or "voter list" in normalized_type.lower()
+            or "voter roll" in normalized_type.lower()
+            or "electoral register" in normalized_type.lower()
+            or "voter register" in normalized_type.lower()
+        )
+
+        if not voter_type:
+            return normalized_type
+
+        # ----------------------------------------------------
+        # Count actual voter-related evidence.
+        # ----------------------------------------------------
+
+        voter_evidence = 0
+
+        # ----------------------------------------------------
+        # 1. Actual structured records.
+        # ----------------------------------------------------
+
+        record_count = (
+            self._count_structured_records(
+                document_text
+            )
+        )
+
+        if record_count is not None:
+            voter_evidence += 1
+
+        # ----------------------------------------------------
+        # 2. Serial number fields.
+        # ----------------------------------------------------
+
+        if any(
+            "serial number fields" in item
+            for item in structural_evidence
+        ):
+            voter_evidence += 1
+
+        # ----------------------------------------------------
+        # 3. EPIC / Voter ID fields.
+        # ----------------------------------------------------
+
+        if any(
+            "EPIC/Voter ID fields" in item
+            for item in structural_evidence
+        ):
+            voter_evidence += 1
+
+        # ----------------------------------------------------
+        # 4. Multiple voter demographic fields.
+        #
+        # One generic "name" or "age" word is not enough.
+        # We require multiple related fields.
+        # ----------------------------------------------------
+
+        voter_demographic_signals = 0
+
+        for item in structural_evidence:
+
+            if "name fields" in item:
+                voter_demographic_signals += 1
+
+            if "age fields" in item:
+                voter_demographic_signals += 1
+
+            if "gender fields" in item:
+                voter_demographic_signals += 1
+
+            if "relation fields" in item:
+                voter_demographic_signals += 1
+
+            if "house/address fields" in item:
+                voter_demographic_signals += 1
+
+        if voter_demographic_signals >= 2:
+            voter_evidence += 1
+
+        # ----------------------------------------------------
+        # 5. Explicit electoral-roll terminology.
+        # ----------------------------------------------------
+
+        explicit_voter_terms = re.search(
+            r"""
+            \b(
+                electoral\s+roll|
+                voter\s+list|
+                voters?\s+list|
+                electoral\s+register|
+                voter\s+register
+            )\b
+            """,
+            normalized_text,
+            flags=re.IGNORECASE | re.VERBOSE,
+        )
+
+        if explicit_voter_terms:
+            voter_evidence += 1
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # A document discussing:
+        #
+        # democracy
+        # government
+        # constitution
+        # citizens
+        # suffrage
+        # political parties
+        #
+        # is NOT automatically a voter list.
+        # ----------------------------------------------------
+
+        if voter_evidence < 2:
+
+            print(
+                "\n========== DOCUMENT TYPE VALIDATION =========="
+            )
+
+            print(
+                "LLM attempted Electoral Roll / Voter List "
+                "classification."
+            )
+
+            print(
+                f"Voter evidence score: {voter_evidence}"
+            )
+
+            print(
+                "Classification rejected because sufficient "
+                "voter-list evidence was not found."
+            )
+
+            print(
+                "Using General Informational / Reference Document."
+            )
+
+            print(
+                "==============================================\n"
+            )
+
+            return (
+                "General Informational / Reference Document"
+            )
+
+        return normalized_type
+
+    # ========================================================
     # BUILD GROUNDING INFORMATION
     # ========================================================
 
@@ -919,70 +1855,154 @@ GROUNDING INFORMATION
 CRITICAL CLASSIFICATION RULE
 ==================================================
 
-If the supplied evidence is sufficiently distinctive for a
-specific document category, YOU MUST IDENTIFY THAT CATEGORY.
+The document type MUST be determined from evidence that
+actually appears in THIS uploaded document.
 
-Do NOT weaken a supported classification by saying:
+The LLM must never create evidence that is not present.
 
-"The specific document type cannot be determined"
+Python structural evidence is authoritative for whether
+a detected structural signal actually exists.
 
-when the supplied evidence clearly supports a specific type.
+If Python reports:
 
-For example:
+STRUCTURAL EVIDENCE:
+- No specific structural evidence was automatically extracted.
 
-If the evidence shows a combination of:
+then you MUST NOT claim that the document contains:
 
 - voter serial numbers
-- EPIC/Voter ID-style identifiers
+- EPIC/Voter IDs
 - voter names
-- age
-- gender
+- voter ages
+- voter genders
 - relation information
-- house/address information
+- voter house/address records
+- marks
+- grades
+- invoice line items
+- passport numbers
+- medical records
+- banking records
 
-then the document has sufficient evidence to identify it as:
+unless those things are visibly present in the supplied
+DOCUMENT CONTEXT itself.
+
+==================================================
+ELECTORAL ROLL / VOTER LIST RULE
+==================================================
+
+Do NOT classify a document as:
 
 Electoral Roll / Voter List
 
-Do not replace this with:
+merely because it discusses:
 
-"List"
+- India
+- democracy
+- elections
+- government
+- constitution
+- citizens
+- voting
+- universal adult suffrage
+- political systems
+- political parties
+- governance
 
-"Register"
+These topics describe political or civic subjects.
 
-"Administrative document"
+They are NOT, by themselves, evidence that the document
+is an Electoral Roll / Voter List.
 
-or:
+An Electoral Roll / Voter List classification requires
+actual document evidence such as:
 
-"The specific document type cannot be determined."
+- voter records
+- electoral-roll entries
+- voter serial numbers
+- EPIC/Voter ID values
+- voter names combined with demographic fields
+- age/gender/relation/house information belonging to
+  voter entries
+- explicit electoral-roll structure
 
-That example is only an illustration of how to reason from
-specific evidence.
+The evidence must actually occur in THIS document.
 
-Apply the same reasoning to other document types.
-
-For example:
-
-Subjects + marks + grades + percentage + student/examination
-information can support:
-
-Mark Sheet / Academic Result
-
-Passport number + nationality + date of birth + expiry
-information can support:
-
-Passport
-
-Invoice number + line items + tax + total can support:
-
-Invoice
-
-Again, these are examples only.
-
-Classify THIS document from THIS document's evidence.
+Never invent these fields.
 
 ==================================================
-IMPORTANT DOCUMENT-LEVEL BEHAVIOR
+NO EVIDENCE = DO NOT CLAIM EVIDENCE
+==================================================
+
+If the Python structural evidence is empty and the document
+context does not contain a specific record structure, do not
+invent a structured-document classification.
+
+A general informational document may contain prose about:
+
+- geography
+- history
+- culture
+- economy
+- government
+- democracy
+- society
+- science
+- technology
+- education
+
+Such a document should be classified according to its actual
+content and purpose.
+
+Do not transform a general discussion of democracy into a
+voter list.
+
+==================================================
+GENERAL INFORMATIONAL DOCUMENTS
+==================================================
+
+Not every document is a structured record, form, register,
+or table.
+
+If the document consists primarily of prose describing a
+topic, and it does not contain a more specific structured
+document type, classify it according to the actual subject
+and purpose.
+
+For example, a document containing sections about:
+
+- geography
+- history
+- culture
+- economy
+- government
+- democracy
+
+may be classified as:
+
+General Informational / Reference Document
+
+Do not force such a document into a structured category
+such as Electoral Roll / Voter List merely because one of
+its topics is democracy or voting.
+
+==================================================
+CLASSIFICATION PRIORITY
+==================================================
+
+Use this order:
+
+1. Actual document content.
+2. Explicit structural evidence visible in the document.
+3. Python-detected structural evidence.
+4. General interpretation.
+
+Never reverse this order.
+
+General knowledge must never override actual document evidence.
+
+==================================================
+DOCUMENT-LEVEL BEHAVIOR
 ==================================================
 
 This is DOCUMENT ANALYSIS.
@@ -1022,6 +2042,14 @@ Do NOT estimate.
 Do NOT count only the records visible in the sample context.
 
 Do NOT invent another number.
+
+If the verified structured record count says:
+
+Not determinable from the extracted structure.
+
+then write:
+
+Not explicitly stated in the document.
 
 ==================================================
 TASK
@@ -1126,6 +2154,13 @@ STRICT GROUNDING RULES
 
 21. The analysis must describe THIS uploaded document,
     not a generic example.
+
+22. Never claim that a field exists unless that field actually
+    appears in the supplied document context.
+
+23. Do not infer a voter list from general discussion of
+    democracy, elections, government, citizenship, voting,
+    or political systems.
 
 ==================================================
 OUTPUT RULES
@@ -1277,6 +2312,64 @@ Respond in ENGLISH.
                 raise AnalysisException(
                     "The AI model returned an empty analysis."
                 )
+
+            # -----------------------------------------
+            # Extract document type from AI response
+            # -----------------------------------------
+
+            detected_document_type = (
+                self._extract_document_type(
+                    summary
+                )
+            )
+
+            print(
+                "\n========== DOCUMENT TYPE EXTRACTION =========="
+            )
+
+            print(
+                f"LLM Document Type: "
+                f"{detected_document_type}"
+            )
+
+            # -----------------------------------------
+            # Validate document type
+            # -----------------------------------------
+
+            validated_document_type = (
+                self._validate_document_type(
+                    document_type=detected_document_type,
+                    document_text=document_text,
+                    structural_evidence=structural_evidence,
+                )
+            )
+
+            print(
+                f"Validated Document Type: "
+                f"{validated_document_type}"
+            )
+
+            print(
+                "=============================================\n"
+            )
+
+            # -----------------------------------------
+            # Store validated document type
+            # -----------------------------------------
+
+            print(
+                "DEBUG: Updating document type..."
+            )
+
+            self.document_repository.update_document_type(
+                connection=connection,
+                document_id=document_id,
+                document_type=validated_document_type,
+            )
+
+            print(
+                "DEBUG: Document type updated successfully."
+            )
 
             # -----------------------------------------
             # Save analysis

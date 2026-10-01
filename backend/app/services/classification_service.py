@@ -1,3 +1,4 @@
+
 import re
 
 
@@ -226,7 +227,18 @@ class ClassificationService:
         # RESUME
         # ========================================================
 
-        resume_keywords = [
+        # IMPORTANT:
+        #
+        # Generic words such as:
+        #   education
+        #   skills
+        #   projects
+        #
+        # are NOT enough to classify a document as a resume.
+        #
+        # Strong resume-specific indicators are required.
+
+        strong_resume_keywords = [
             "resume",
             "curriculum vitae",
             "professional summary",
@@ -234,38 +246,48 @@ class ClassificationService:
             "work experience",
             "employment history",
             "career objective",
+            "career summary",
             "technical skills",
-            "skills",
-            "projects",
-            "certifications",
-            "education",
+            "contact information",
+            "linkedin",
+            "github",
         ]
 
-        for keyword in resume_keywords:
+        for keyword in strong_resume_keywords:
 
             if keyword in text_lower:
-                scores["resume"] += 1
 
-        # Strong resume indicators
+                scores["resume"] += 3
 
-        if "work experience" in text_lower:
+        # --------------------------------------------------------
+        # RESUME STRUCTURE
+        # --------------------------------------------------------
+
+        resume_sections = [
+            "professional experience",
+            "work experience",
+            "employment history",
+            "technical skills",
+            "education",
+            "projects",
+            "certifications",
+        ]
+
+        resume_section_matches = sum(
+            1
+            for section in resume_sections
+            if section in text_lower
+        )
+
+        # Multiple resume sections provide stronger evidence.
+
+        if resume_section_matches >= 3:
 
             scores["resume"] += 3
 
-        if "professional experience" in text_lower:
+        elif resume_section_matches >= 2:
 
-            scores["resume"] += 3
-
-        if "technical skills" in text_lower:
-
-            scores["resume"] += 3
-
-        if (
-            "projects" in text_lower
-            and "skills" in text_lower
-        ):
-
-            scores["resume"] += 2
+            scores["resume"] += 1
 
         # ========================================================
         # MARKSHEET
@@ -309,27 +331,12 @@ class ClassificationService:
             scores["marksheet"] += 3
 
         # ========================================================
-        # RESUME PRIORITY
-        # ========================================================
-
-        # A resume normally contains education/university/
-        # examination information, so strong resume indicators
-        # should override weak academic keywords.
-
-        if scores["resume"] >= 4:
-
-            scores["marksheet"] = min(
-                scores["marksheet"],
-                3,
-            )
-
-        # ========================================================
         # VOTER LIST PRIORITY
         # ========================================================
 
         # A voter list contains many voter records.
         # If strong voter-list evidence exists, prefer
-        # voter_list over a generic voter_id classification.
+        # voter_list over generic voter_id classification.
 
         if scores["voter_list"] >= 5:
 
@@ -337,6 +344,33 @@ class ClassificationService:
                 scores["voter_id"],
                 2,
             )
+
+        # ========================================================
+        # DEBUG
+        # ========================================================
+
+        print(
+            "\n========== CLASSIFICATION DEBUG =========="
+        )
+
+        print(
+            "Scores:",
+            scores,
+        )
+
+        print(
+            "EPIC matches:",
+            len(epic_matches),
+        )
+
+        print(
+            "Resume section matches:",
+            resume_section_matches,
+        )
+
+        print(
+            "==========================================\n"
+        )
 
         # ========================================================
         # FIND BEST MATCH

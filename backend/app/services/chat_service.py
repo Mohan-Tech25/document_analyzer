@@ -2078,6 +2078,34 @@ ANSWER:
             )
         )
 
+        print(
+            "\n"
+            "========== VOTER QUERY INFO DEBUG =========="
+        )
+
+        print("QUESTION:", question)
+        print("QUERY INFO:", query_info)
+
+        if query_info:
+            print(
+                "LOOKUP TYPE:",
+                query_info.get("lookup_type")
+            )
+
+            print(
+                "LOOKUP VALUE:",
+                query_info.get("value")
+            )
+
+            print(
+                "REQUESTED FIELDS:",
+                query_info.get("requested_fields")
+            )
+
+            print(
+                "==========================================="
+            )
+
         if not query_info:
             return UNAVAILABLE_MESSAGE
 
@@ -2111,6 +2139,56 @@ ANSWER:
                 query=query_info,
             )
         )
+
+        print(
+            "\n"
+            "========== VOTER MATCH RESULT DEBUG =========="
+        )
+
+        print(
+            "TOTAL PARSED RECORDS:",
+            len(records)
+        )
+
+        print(
+            "MATCHED RECORD COUNT:",
+            len(matched_records)
+        )
+
+        for record in matched_records:
+
+            print(
+                "\nMATCHED RECORD:"
+            )
+
+            print(
+                "SERIAL:",
+                record.get("serial_number")
+            )
+
+            print(
+                "NAME:",
+                record.get("name")
+            )
+
+            print(
+                "EPIC NUMBERS:",
+                record.get("epic_numbers")
+            )
+
+            print(
+                "HOUSE:",
+                record.get("house_number")
+            )
+
+            print(
+                "AGE:",
+                record.get("age")
+            )
+
+            print(
+                "=============================================="
+            )
 
         if (
             not matched_records
@@ -2306,6 +2384,40 @@ ANSWER:
                     record=record,
                     field_name=requested_field,
                 )
+            )
+
+            print(
+                "\n"
+                "========== EXACT VOTER FIELD DEBUG =========="
+            )
+
+            print(
+                "REQUESTED FIELD:",
+                requested_field
+            )
+
+            print(
+                "RECORD NAME:",
+                record.get("name")
+            )
+
+            print(
+                "RECORD SERIAL:",
+                record.get("serial_number")
+            )
+
+            print(
+                "RECORD EPIC NUMBERS:",
+                record.get("epic_numbers")
+            )
+
+            print(
+                "EXACT VALUE:",
+                exact_value
+            )
+
+            print(
+                "============================================="
             )
 
             if exact_value == UNAVAILABLE_MESSAGE:
@@ -2645,37 +2757,104 @@ ANSWER:
         document_id: int,
         question: str,
     ) -> str:
+        """
+        Answer a user question about a document.
+
+        Routes image questions through the vision pipeline,
+        voter-list questions through the structured voter lookup
+        pipeline, and all other questions through the normal
+        document pipeline.
+        """
+
+        # --------------------------------------------------------
+        # Preserve original question validation.
+        # --------------------------------------------------------
 
         if not question or not question.strip():
-
             raise ChatException(
                 "Question cannot be empty."
             )
 
         question = question.strip()
 
-        document_row = (
+        # --------------------------------------------------------
+        # Load document.
+        # --------------------------------------------------------
+
+        document = self._document_row_to_dict(
             self.document_repository.get_by_id(
-                connection=connection,
-                document_id=document_id,
+                connection,
+                document_id,
             )
         )
 
-        if not document_row:
-
+        if not document:
             raise ChatException(
                 "Document not found."
             )
 
-        document = (
-            self._document_row_to_dict(
-                document_row
+        # --------------------------------------------------------
+        # Normalize document type locally so voter routing works
+        # correctly for the stored database value.
+        # --------------------------------------------------------
+
+        document_type = (
+            str(
+                document.get(
+                    "document_type",
+                    "",
+                )
             )
+            .strip()
+            .lower()
         )
 
-        if self._is_image(
-            document
-        ):
+        is_voter_list = document_type in {
+            "voter_list",
+            "electoral roll / voter list",
+        }
+
+        # --------------------------------------------------------
+        # Preserve image-document routing.
+        #
+        # This must remain before the generic document route so
+        # image questions continue to use the vision model.
+        # --------------------------------------------------------
+
+        if self._is_image(document):
+
+            print(
+                "\n"
+                "========== CHAT ROUTING DEBUG =========="
+            )
+
+            print(
+                "DOCUMENT ID:",
+                document_id,
+            )
+
+            print(
+                "DOCUMENT TYPE:",
+                document_type,
+            )
+
+            print(
+                "IS VOTER LIST:",
+                is_voter_list,
+            )
+
+            print(
+                "QUESTION:",
+                question,
+            )
+
+            print(
+                "ROUTE: IMAGE QUESTION"
+            )
+
+            print(
+                "========================================"
+            )
 
             return self._answer_image_question(
                 connection=connection,
@@ -2684,14 +2863,56 @@ ANSWER:
                 document=document,
             )
 
-        document_type = str(
-            document.get(
-                "document_type",
-                "",
-            )
-        ).strip().lower()
+        # --------------------------------------------------------
+        # Chat routing debug.
+        # --------------------------------------------------------
 
-        if document_type == "voter_list":
+        print(
+            "\n"
+            "========== CHAT ROUTING DEBUG =========="
+        )
+
+        print(
+            "DOCUMENT ID:",
+            document_id,
+        )
+
+        print(
+            "DOCUMENT TYPE:",
+            document_type,
+        )
+
+        print(
+            "IS VOTER LIST:",
+            is_voter_list,
+        )
+
+        print(
+            "QUESTION:",
+            question,
+        )
+
+        if is_voter_list:
+
+            print(
+                "ROUTE: VOTER QUESTION"
+            )
+
+        else:
+
+            print(
+                "ROUTE: GENERIC DOCUMENT QUESTION"
+            )
+
+        print(
+            "========================================"
+        )
+
+        # --------------------------------------------------------
+        # Voter-list documents use the structured voter pipeline.
+        # --------------------------------------------------------
+
+        if is_voter_list:
 
             return self._answer_voter_question(
                 connection=connection,
@@ -2699,6 +2920,11 @@ ANSWER:
                 question=question,
                 document=document,
             )
+
+        # --------------------------------------------------------
+        # All remaining documents use the generic document
+        # question-answering pipeline.
+        # --------------------------------------------------------
 
         return self._answer_document_question(
             connection=connection,

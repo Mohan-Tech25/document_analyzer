@@ -384,6 +384,10 @@ class AnalysisService:
     # EXTRACT STRUCTURAL EVIDENCE
     # ========================================================
 
+        # ========================================================
+    # EXTRACT STRUCTURAL EVIDENCE
+    # ========================================================
+
     def _extract_structural_evidence(
         self,
         document_text: str,
@@ -393,13 +397,9 @@ class AnalysisService:
 
         This method does NOT classify the document.
 
-        It only reports evidence that physically appears in
-        the extracted document.
-
-        The LLM can then interpret the evidence.
-
-        Structural signals are supporting evidence only.
-        They must be checked against the actual document context.
+        It detects both English and common Tamil voter-list
+        field labels because OCR output may preserve the
+        original Tamil document language.
         """
 
         if not document_text:
@@ -418,31 +418,85 @@ class AnalysisService:
         field_patterns = [
             (
                 "serial number fields",
-                r"\bserial[_\s-]*number\b",
+                r"""
+                \bserial[_\s-]*number\b
+                |
+                \bserial[_\s-]*no\.?\b
+                |
+                வரிசை\s*எண்
+                """,
             ),
             (
                 "name fields",
-                r"\b(?:voter[_\s-]*)?name\b",
+                r"""
+                \b(?:voter[_\s-]*)?name\b
+                |
+                பெயர்
+                """,
             ),
             (
                 "age fields",
-                r"\bage\b",
+                r"""
+                \bage\b
+                |
+                வயது
+                """,
             ),
             (
                 "gender fields",
-                r"\bgender\b",
+                r"""
+                \bgender\b
+                |
+                \bsex\b
+                |
+                பாலினம்
+                |
+                ஆண்
+                |
+                பெண்
+                """,
             ),
             (
                 "relation fields",
-                r"\brelation(?:[_\s-]*name|[_\s-]*type)?\b",
+                r"""
+                \brelation(?:[_\s-]*name|[_\s-]*type)?\b
+                |
+                \bfather'?s?\s+name\b
+                |
+                \bmother'?s?\s+name\b
+                |
+                \bhusband'?s?\s+name\b
+                |
+                தந்தையின்\s*பெயர்
+                |
+                தாயின்\s*பெயர்
+                |
+                கணவர்\s*பெயர்
+                |
+                உறவு
+                """,
             ),
             (
                 "house/address fields",
-                r"\b(?:house[_\s-]*number|address)\b",
+                r"""
+                \b(?:house[_\s-]*number|address)\b
+                |
+                வீட்டு\s*எண்
+                |
+                முகவரி
+                """,
             ),
             (
                 "EPIC/Voter ID fields",
-                r"\b(?:epic|voter[_\s-]*id|voter[_\s-]*identity)\b",
+                r"""
+                \bepic\b
+                |
+                \bvoter[_\s-]*id\b
+                |
+                \bvoter[_\s-]*identity\b
+                |
+                வாக்காளர்\s*அடையாள
+                """,
             ),
             (
                 "marks/score fields",
@@ -475,7 +529,7 @@ class AnalysisService:
             if re.search(
                 pattern,
                 normalized_text,
-                flags=re.IGNORECASE,
+                flags=re.IGNORECASE | re.VERBOSE,
             ):
                 evidence.append(
                     f"The extracted document contains {label}."
@@ -483,14 +537,6 @@ class AnalysisService:
 
         # ----------------------------------------------------
         # Detect EPIC-like identifiers directly from content.
-        #
-        # Example:
-        #
-        # RMK1631050
-        # KLS2345015
-        #
-        # This is evidence only.
-        # It does NOT itself force a document classification.
         # ----------------------------------------------------
 
         epic_values = re.findall(
@@ -517,6 +563,28 @@ class AnalysisService:
                 "identifier values of this pattern were found "
                 "in the extracted content."
             )
+        
+        serial_values = re.findall(
+            r"(?m)^\s*(\d{1,4})\s*$",
+            normalized_text,
+        )
+
+        serial_values = sorted(
+            {
+                int(value)
+                for value in serial_values
+                if 1 <= int(value) <= 9999
+            }
+        )
+
+        if serial_values:
+            evidence.append(
+            "The extracted document contains serial-number fields."
+        )
+
+        evidence.append(
+        f"At least {len(serial_values)} distinct serial-number values were found in the extracted content."
+        )
 
         # ----------------------------------------------------
         # Detect structured parser records.
@@ -534,22 +602,48 @@ class AnalysisService:
                 f"The extracted content contains "
                 f"{record_count} structured records."
             )
+                # ----------------------------------------------------
+        # DEBUG
+        # ----------------------------------------------------
 
+        print()
+        print("========== STRUCTURAL EVIDENCE DEBUG ==========")
+
+        print(
+            f"Normalized text length: "
+            f"{len(normalized_text)}"
+        )
+
+        print(
+            f"Structured record count: "
+            f"{record_count}"
+        )
+
+        print(
+            f"EPIC-like values found: "
+            f"{len(epic_values)}"
+        )
+
+        print("Evidence items:")
+
+        for item in evidence:
+            print(f"- {item}")
+
+        print(
+            f"Total evidence items: "
+            f"{len(evidence)}"
+        )
+
+        print(
+            "==============================================="
+        )
+
+        
         return evidence
-
     # ========================================================
     # EXTRACT DOCUMENT TYPE FROM LLM RESPONSE
     # ========================================================
 
-
-    # ========================================================
-    # EXTRACT DOCUMENT TYPE FROM LLM RESPONSE
-    # ========================================================
-
-    
-    # ========================================================
-    # EXTRACT DOCUMENT TYPE FROM LLM RESPONSE
-    # ========================================================
 
     def _extract_document_type(
         self,
@@ -1360,7 +1454,8 @@ class AnalysisService:
 
         if any(
             "serial number fields" in item
-            for item in structural_evidence
+            or "serial-number fields" in item
+        for item in structural_evidence
         ):
             voter_evidence += 1
 
@@ -1370,7 +1465,9 @@ class AnalysisService:
 
         if any(
             "EPIC/Voter ID fields" in item
-            for item in structural_evidence
+            or "EPIC/Voter ID-style pattern" in item
+            or "identifier values matching" in item
+        for item in structural_evidence
         ):
             voter_evidence += 1
 
